@@ -1,0 +1,50 @@
+From 4e9bcb6fa245f6499635b2033dc498d0af6d9a78 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Tue, 13 Oct 2026 22:30:31 -0400
+Subject: [PATCH] binman: use importlib.resources instead of pkg_resources
+
+pkg_resources is gone from current setuptools, so binman fails with
+"ModuleNotFoundError: No module named 'pkg_resources'".  Read the
+missing-blob help and list the entry types with importlib.resources
+(Python 3.9+), as upstream U-Boot does.
+
+Host-side only: the firmware images are unchanged.
+---
+ tools/binman/control.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/tools/binman/control.py b/tools/binman/control.py
+index 2f002792..db7aec5f 100644
+--- a/tools/binman/control.py
++++ b/tools/binman/control.py
+@@ -13,7 +13,6 @@ except ImportError:  # pragma: no cover
+     # for Python 3.6
+     import importlib_resources
+ import os
+-import pkg_resources
+ import re
+ 
+ import sys
+@@ -96,7 +95,8 @@ def _ReadMissingBlobHelp():
+             msg = ''
+         return tag, msg
+ 
+-    my_data = pkg_resources.resource_string(__name__, 'missing-blob-help')
++    my_data = importlib.resources.files(__package__).joinpath(
++        'missing-blob-help').read_bytes()
+     re_tag = re.compile('^([-a-z0-9]+):$')
+     result = {}
+     tag = None
+@@ -151,7 +151,8 @@ def GetEntryModules(include_testing=True):
+     Returns:
+         Set of paths to entry class filenames
+     """
+-    glob_list = pkg_resources.resource_listdir(__name__, 'etype')
++    glob_list = [entry.name for entry in
++                 importlib.resources.files(__package__).joinpath('etype').iterdir()]
+     glob_list = [fname for fname in glob_list if fname.endswith('.py')]
+     return set([os.path.splitext(os.path.basename(item))[0]
+                 for item in glob_list
+-- 
+2.43.0
+
