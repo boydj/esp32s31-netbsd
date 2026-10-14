@@ -1,0 +1,1545 @@
+From 9e57ee4ab63e6b77642c9338d3f94ebe72e029d1 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Tue, 13 Oct 2026 20:33:15 -0400
+Subject: [PATCH 1/2] hw/riscv: add Espressif ESP32-S31 machine with CLIC-mode
+ harts
+
+Adds an "esp32s31" machine (HP core 0) and "esp32s31" CPU model:
+- target/riscv: Espressif-style CLIC operating in CLIC mode (traps with
+  xcause.exccode = input id, xtvec[5:0] forced, xcause.xpp/xpie aliases,
+  xpil and interrupt levels, xret level restore for interrupt-type
+  xcause only, S-mode sie/sip trap), wfi wakeup
+- vendor PMA CSRs
+- CLIC (M and S banks), interrupt matrix, SYSTIMER, UART0, LP AON
+  reset, flash XIP window, PSRAM, HP/LP SRAM, mask ROM stubs
+- emulates the U-Boot SPL: boots a raw 16MiB flash image by loading the
+  U-Boot FIT (OpenSBI fw_dynamic + U-Boot + dtb)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/riscv/Kconfig              |   7 +
+ hw/riscv/esp32s31.c           | 982 ++++++++++++++++++++++++++++++++++
+ hw/riscv/meson.build          |   1 +
+ target/riscv/cpu-qom.h        |   1 +
+ target/riscv/cpu.c            |  33 ++
+ target/riscv/cpu.h            |  16 +
+ target/riscv/tcg/cpu_helper.c |  92 ++++
+ target/riscv/tcg/csr.c        |  48 ++
+ target/riscv/tcg/csr.h        |   3 +
+ target/riscv/tcg/esp_csr.c    |  70 +++
+ target/riscv/tcg/meson.build  |   1 +
+ target/riscv/tcg/op_helper.c  |  15 +
+ 12 files changed, 1269 insertions(+)
+ create mode 100644 hw/riscv/esp32s31.c
+ create mode 100644 target/riscv/tcg/esp_csr.c
+
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+index de37c08..6601fbd 100644
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -69,6 +69,13 @@ config RISCV_VIRT
+     select ACPI
+     select ACPI_PCI
+ 
++config ESP32S31
++    bool
++    default y
++    depends on RISCV32
++    select RISCV_ACLINT
++    select UNIMP
++
+ config SHAKTI_C
+     bool
+     default y
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+new file mode 100644
+index 0000000..2e0a93e
+--- /dev/null
++++ b/hw/riscv/esp32s31.c
+@@ -0,0 +1,982 @@
++/*
++ * Espressif ESP32-S31 (HP core) machine model.
++ *
++ * Models what the software stack after the mask ROM and the U-Boot SPL
++ * relies on:
++ *
++ *   0x2E000000  LP SRAM (32KiB)
++ *   0x2F000000  HP SRAM (512KiB): OpenSBI
++ *   0x2F800000  mask ROM: the cache maintenance entry points OpenSBI calls
++ *               (stubbed: QEMU has no caches)
++ *   0x10800000  CLIC, machine-mode bank
++ *   0x10A00000  CLIC, supervisor-mode bank
++ *   0x2038A000  UART0                  (interrupt matrix source 9)
++ *   0x20399000  SYSTIMER               (source 33 = TARGET0 alarm)
++ *   0x20585000  interrupt matrix (core 0)
++ *   0x2070103C  LP_AONCLKRST_HPCORE0_RESET_CTRL (bit 20 resets the chip)
++ *   0x40000000  NOR flash, cached XIP window (64MiB)
++ *   0x50000000  PSRAM, cached window (16MiB populated)
++ *
++ * The hart runs its CLIC in CLIC mode (see target/riscv: env->clic_mode).
++ *
++ * Booting: give the full flash image with -machine esp32s31,flash=FILE.
++ * The SPL's job is emulated: the flash is mapped at 0x40000000 starting at
++ * raw offset "xip-offset" (default 0x100000, Espressif's BSP layout), the
++ * U-Boot FIT found there is loaded (firmware = OpenSBI fw_dynamic,
++ * loadables = U-Boot, fdt) and OpenSBI is entered in M-mode with a
++ * fw_dynamic_info pointing at U-Boot.  Alternatively -bios/-kernel work as
++ * on other boards.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/units.h"
++#include "qemu/log.h"
++#include "qemu/error-report.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "hw/core/boards.h"
++#include "hw/core/loader.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/riscv/machines-qom.h"
++#include "hw/riscv/riscv_hart.h"
++#include "hw/riscv/boot.h"
++#include "hw/intc/riscv_aclint.h"
++#include "hw/misc/unimp.h"
++#include "chardev/char-fe.h"
++#include "system/system.h"
++#include "system/address-spaces.h"
++#include "system/runstate.h"
++#include "system/reset.h"
++#include "target/riscv/cpu.h"
++#include <libfdt.h>
++
++#define TYPE_ESP32S31_MACHINE MACHINE_TYPE_NAME("esp32s31")
++OBJECT_DECLARE_SIMPLE_TYPE(Esp32s31State, ESP32S31_MACHINE)
++
++enum {
++    S31_LPRAM_BASE      = 0x2e000000, S31_LPRAM_SIZE  = 32 * KiB,
++    S31_HPRAM_BASE      = 0x2f000000, S31_HPRAM_SIZE  = 512 * KiB,
++    S31_MROM_BASE       = 0x2f800000, S31_MROM_SIZE   = 64 * KiB,
++    S31_RESETVEC_BASE   = 0x00001000, S31_RESETVEC_SIZE = 4 * KiB,
++    S31_CLIC_M_BASE     = 0x10800000,
++    S31_CLIC_S_BASE     = 0x10a00000, S31_CLIC_SIZE   = 0x2000,
++    S31_PERIPH_BASE     = 0x20000000, S31_PERIPH_SIZE = 0x01000000,
++    S31_UART0_BASE      = 0x2038a000, S31_UART_SIZE   = 0x1000,
++    S31_SYSTIMER_BASE   = 0x20399000, S31_SYSTIMER_SIZE = 0x100,
++    S31_INTMTX_BASE     = 0x20585000, S31_INTMTX_SIZE = 0x800,
++    S31_LPAON_BASE      = 0x20701000, S31_LPAON_SIZE  = 0x1000,
++    S31_MTIMER_BASE     = 0x3f000000, /* not on the chip; backs the time CSR */
++    S31_FLASH_BASE      = 0x40000000, S31_FLASH_SIZE  = 64 * MiB,
++    S31_PSRAM_BASE      = 0x50000000, S31_PSRAM_SIZE  = 16 * MiB,
++};
++
++#define S31_TIMEBASE_FREQ   320000000
++#define S31_SRC_UART0       9
++#define S31_SRC_SYSTIMER0   33
++
++#define CLIC_NIDS           64
++#define INTMTX_NSRC         128
++
++struct Esp32s31State {
++    MachineState parent_obj;
++
++    RISCVHartArrayState cpus;
++    MemoryRegion lpram, hpram, mrom, resetvec, psram, flash;
++    MemoryRegion clic_m_mr, clic_s_mr, intmtx_mr, systimer_mr, uart_mr;
++    MemoryRegion lpaon_mr;
++
++    /* properties */
++    char *flash_file;
++    uint32_t xip_offset;
++
++    /* CLIC */
++    uint32_t cliccfg;
++    uint8_t clicintip[CLIC_NIDS];
++    uint8_t clicintie[CLIC_NIDS];
++    uint8_t clicintattr[CLIC_NIDS];
++    uint8_t clicintctl[CLIC_NIDS];
++    bool clic_in[CLIC_NIDS];
++
++    /* interrupt matrix */
++    uint32_t intmtx[INTMTX_NSRC];
++    bool src_level[INTMTX_NSRC];
++
++    /* SYSTIMER */
++    uint32_t st_conf;
++    uint32_t st_unit0_op;
++    uint32_t st_val_hi, st_val_lo;
++    uint32_t st_target0_hi, st_target0_lo, st_target0_conf;
++    uint32_t st_int_ena, st_int_raw;
++    uint64_t st_target;
++    bool st_loaded;
++    QEMUTimer *st_timer;
++
++    /* UART0 */
++    CharFrontend chr;
++    uint8_t rx_fifo[128];
++    uint32_t rx_head, rx_count;
++    uint32_t uart_int_raw, uart_int_ena;
++    uint32_t uart_regs[0x100 / 4];
++};
++
++/* ---------------------------------------------------------------- CLIC */
++
++#define CLIC_ATTR_MODE_SHIFT    6
++#define CLIC_ATTR_TRIG_MASK     0x6
++#define CLIC_CFG_NMBITS(cfg)    (((cfg) >> 4) & 3)
++
++static int clic_target_mode(Esp32s31State *s, int id)
++{
++    unsigned mode = s->clicintattr[id] >> CLIC_ATTR_MODE_SHIFT;
++
++    if (CLIC_CFG_NMBITS(s->cliccfg) >= 1 && mode == 1) {
++        return PRV_S;
++    }
++    return PRV_M;
++}
++
++static bool esp32s31_clic_highest(void *opaque, int *out_id,
++                                  uint8_t *out_level, int *out_mode)
++{
++    Esp32s31State *s = opaque;
++    int best = -1, best_mode = PRV_U;
++    uint8_t best_level = 0;
++
++    for (int id = 0; id < CLIC_NIDS; id++) {
++        if (!(s->clicintie[id] & 1) || !(s->clicintip[id] & 1)) {
++            continue;
++        }
++        int mode = clic_target_mode(s, id);
++        uint8_t level = s->clicintctl[id];
++        if (best < 0 || mode > best_mode ||
++            (mode == best_mode && level >= best_level)) {
++            best = id;
++            best_mode = mode;
++            best_level = level;
++        }
++    }
++    if (best < 0) {
++        return false;
++    }
++    *out_id = best;
++    *out_level = best_level;
++    *out_mode = best_mode;
++    return true;
++}
++
++static void esp32s31_clic_update(Esp32s31State *s)
++{
++    /* level triggered inputs follow the line */
++    for (int id = 0; id < CLIC_NIDS; id++) {
++        if ((s->clicintattr[id] & CLIC_ATTR_TRIG_MASK) == 0) {
++            s->clicintip[id] = s->clic_in[id];
++        }
++    }
++    for (int i = 0; i < s->cpus.num_harts; i++) {
++        riscv_cpu_interrupt(&s->cpus.harts[i].env);
++    }
++}
++
++static void esp32s31_clic_set_input(Esp32s31State *s, int id, bool level)
++{
++    bool old = s->clic_in[id];
++
++    s->clic_in[id] = level;
++    if ((s->clicintattr[id] & CLIC_ATTR_TRIG_MASK) != 0 && level && !old) {
++        s->clicintip[id] = 1;   /* edge triggered: latch rising edges */
++    }
++    esp32s31_clic_update(s);
++}
++
++static uint64_t clic_read(Esp32s31State *s, hwaddr addr, unsigned size,
++                          bool sbank)
++{
++    uint64_t val = 0;
++
++    if (addr < 0x1000) {
++        if (addr == 0) {
++            val = s->cliccfg;
++        } else if (addr == 4) {
++            val = CLIC_NIDS;            /* clicinfo: num_interrupt */
++        }
++        return val;
++    }
++    for (unsigned i = 0; i < size; i++) {
++        hwaddr a = addr + i - 0x1000;
++        int id = a / 4;
++        uint8_t b = 0;
++
++        if (id >= CLIC_NIDS) {
++            continue;
++        }
++        if (sbank && clic_target_mode(s, id) != PRV_S) {
++            continue;                   /* not visible from S-mode */
++        }
++        switch (a & 3) {
++        case 0: b = s->clicintip[id]; break;
++        case 1: b = s->clicintie[id]; break;
++        case 2: b = s->clicintattr[id]; break;
++        case 3: b = s->clicintctl[id]; break;
++        }
++        val |= (uint64_t)b << (8 * i);
++    }
++    return val;
++}
++
++static void clic_write(Esp32s31State *s, hwaddr addr, uint64_t val,
++                       unsigned size, bool sbank)
++{
++    if (addr < 0x1000) {
++        if (addr == 0 && !sbank) {
++            s->cliccfg = val & 0x3f;    /* nmbits/nlbits/nvbits */
++        }
++        return;
++    }
++    for (unsigned i = 0; i < size; i++) {
++        hwaddr a = addr + i - 0x1000;
++        int id = a / 4;
++        uint8_t b = val >> (8 * i);
++
++        if (id >= CLIC_NIDS) {
++            continue;
++        }
++        if (sbank && clic_target_mode(s, id) != PRV_S) {
++            continue;
++        }
++        switch (a & 3) {
++        case 0:
++            if (s->clicintattr[id] & CLIC_ATTR_TRIG_MASK) {
++                s->clicintip[id] = b & 1;   /* only edge pending is writable */
++            }
++            break;
++        case 1:
++            s->clicintie[id] = b & 1;
++            break;
++        case 2:
++            if (sbank) {
++                /* S-mode can't change the privilege mode field */
++                b = (b & 0x3f) | (s->clicintattr[id] & 0xc0);
++            }
++            s->clicintattr[id] = b & 0xc7;
++            break;
++        case 3:
++            s->clicintctl[id] = b;
++            break;
++        }
++    }
++    esp32s31_clic_update(s);
++}
++
++static uint64_t clic_m_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return clic_read(opaque, addr, size, false);
++}
++
++static void clic_m_write(void *opaque, hwaddr addr, uint64_t val,
++                         unsigned size)
++{
++    clic_write(opaque, addr, val, size, false);
++}
++
++static uint64_t clic_s_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return clic_read(opaque, addr, size, true);
++}
++
++static void clic_s_write(void *opaque, hwaddr addr, uint64_t val,
++                         unsigned size)
++{
++    clic_write(opaque, addr, val, size, true);
++}
++
++static const MemoryRegionOps clic_m_ops = {
++    .read = clic_m_read,
++    .write = clic_m_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 4 },
++};
++
++static const MemoryRegionOps clic_s_ops = {
++    .read = clic_s_read,
++    .write = clic_s_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------ interrupt matrix */
++
++static void esp32s31_intmtx_update(Esp32s31State *s)
++{
++    bool lines[CLIC_NIDS] = { false };
++
++    for (int src = 0; src < INTMTX_NSRC; src++) {
++        unsigned id = s->intmtx[src] & 0x3f;
++
++        if (id != 0 && s->src_level[src]) {
++            lines[id] = true;
++        }
++    }
++    for (int id = 0; id < CLIC_NIDS; id++) {
++        if (lines[id] != s->clic_in[id]) {
++            esp32s31_clic_set_input(s, id, lines[id]);
++        }
++    }
++}
++
++static void esp32s31_set_source(Esp32s31State *s, int src, bool level)
++{
++    if (s->src_level[src] != level) {
++        s->src_level[src] = level;
++        esp32s31_intmtx_update(s);
++    }
++}
++
++static uint64_t intmtx_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    if (addr / 4 < INTMTX_NSRC) {
++        return s->intmtx[addr / 4];
++    }
++    return 0;
++}
++
++static void intmtx_write(void *opaque, hwaddr addr, uint64_t val,
++                         unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    if (addr / 4 < INTMTX_NSRC) {
++        s->intmtx[addr / 4] = val & 0x3f;
++        esp32s31_intmtx_update(s);
++    }
++}
++
++static const MemoryRegionOps intmtx_ops = {
++    .read = intmtx_read,
++    .write = intmtx_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* --------------------------------------------------------------- SYSTIMER */
++
++#define ST_CONF             0x00
++#define  ST_CONF_UNIT0_WORK_EN      (1u << 30)
++#define  ST_CONF_TARGET0_WORK_EN    (1u << 24)
++#define ST_UNIT0_OP         0x04
++#define  ST_UNIT0_UPDATE    (1u << 30)
++#define  ST_UNIT0_VALID     (1u << 29)
++#define ST_TARGET0_HI       0x1c
++#define ST_TARGET0_LO       0x20
++#define ST_TARGET0_CONF     0x34
++#define ST_UNIT0_VALUE_HI   0x40
++#define ST_UNIT0_VALUE_LO   0x44
++#define ST_COMP0_LOAD       0x50
++#define ST_INT_ENA          0x64
++#define ST_INT_RAW          0x68
++#define ST_INT_CLR          0x6c
++#define ST_INT_ST           0x70
++#define ST_FREQ             16000000
++
++static uint64_t systimer_count(void)
++{
++    return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ST_FREQ,
++                    NANOSECONDS_PER_SECOND) & ((1ULL << 52) - 1);
++}
++
++static void systimer_update_irq(Esp32s31State *s)
++{
++    esp32s31_set_source(s, S31_SRC_SYSTIMER0,
++                        (s->st_int_raw & s->st_int_ena & 1) != 0);
++}
++
++static void systimer_check(Esp32s31State *s)
++{
++    if (!(s->st_conf & ST_CONF_TARGET0_WORK_EN) || !s->st_loaded) {
++        timer_del(s->st_timer);
++        return;
++    }
++    uint64_t now = systimer_count();
++    if (now >= s->st_target) {
++        s->st_int_raw |= 1;
++        timer_del(s->st_timer);
++        systimer_update_irq(s);
++    } else {
++        int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++            muldiv64(s->st_target - now, NANOSECONDS_PER_SECOND, ST_FREQ) + 1;
++        timer_mod(s->st_timer, ns);
++    }
++}
++
++static void systimer_timer_cb(void *opaque)
++{
++    systimer_check(opaque);
++}
++
++static uint64_t systimer_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    switch (addr) {
++    case ST_CONF:           return s->st_conf;
++    case ST_UNIT0_OP:       return s->st_unit0_op;
++    case ST_TARGET0_HI:     return s->st_target0_hi;
++    case ST_TARGET0_LO:     return s->st_target0_lo;
++    case ST_TARGET0_CONF:   return s->st_target0_conf;
++    case ST_UNIT0_VALUE_HI: return s->st_val_hi;
++    case ST_UNIT0_VALUE_LO: return s->st_val_lo;
++    case ST_INT_ENA:        return s->st_int_ena;
++    case ST_INT_RAW:        return s->st_int_raw;
++    case ST_INT_ST:         return s->st_int_raw & s->st_int_ena;
++    default:
++        return 0;
++    }
++}
++
++static void systimer_write(void *opaque, hwaddr addr, uint64_t val,
++                           unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    switch (addr) {
++    case ST_CONF:
++        s->st_conf = val;
++        systimer_check(s);
++        break;
++    case ST_UNIT0_OP:
++        if (val & ST_UNIT0_UPDATE) {
++            uint64_t now = systimer_count();
++            s->st_val_hi = (now >> 32) & 0xfffff;
++            s->st_val_lo = (uint32_t)now;
++            s->st_unit0_op = ST_UNIT0_VALID;
++        }
++        break;
++    case ST_TARGET0_HI:
++        s->st_target0_hi = val & 0xfffff;
++        break;
++    case ST_TARGET0_LO:
++        s->st_target0_lo = val;
++        break;
++    case ST_TARGET0_CONF:
++        s->st_target0_conf = val;
++        break;
++    case ST_COMP0_LOAD:
++        if (val & 1) {
++            s->st_target = ((uint64_t)s->st_target0_hi << 32) |
++                           s->st_target0_lo;
++            s->st_loaded = true;
++            systimer_check(s);
++        }
++        break;
++    case ST_INT_ENA:
++        s->st_int_ena = val & 7;
++        systimer_update_irq(s);
++        break;
++    case ST_INT_CLR:
++        s->st_int_raw &= ~val;
++        systimer_update_irq(s);
++        break;
++    default:
++        break;
++    }
++}
++
++static const MemoryRegionOps systimer_ops = {
++    .read = systimer_read,
++    .write = systimer_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------------ UART */
++
++#define UART_FIFO           0x00
++#define UART_INT_RAW        0x04
++#define UART_INT_ST         0x08
++#define UART_INT_ENA        0x0c
++#define UART_INT_CLR        0x10
++#define  UART_INT_RXFIFO_FULL   (1u << 0)
++#define  UART_INT_TXFIFO_EMPTY  (1u << 1)
++#define UART_STATUS         0x1c
++#define UART_CONF0          0x20
++#define UART_CONF1          0x24
++#define UART_REG_UPDATE     0x98
++
++static uint32_t uart_raw(Esp32s31State *s)
++{
++    uint32_t conf1 = s->uart_regs[UART_CONF1 / 4];
++    uint32_t rx_thr = conf1 & 0x3ff;
++    uint32_t tx_thr = (conf1 >> 10) & 0x3ff;
++    uint32_t raw = s->uart_int_raw;
++
++    if (rx_thr == 0) {
++        rx_thr = 1;
++    }
++    if (s->rx_count >= rx_thr) {
++        raw |= UART_INT_RXFIFO_FULL;
++    }
++    /* transmission is instantaneous: the TX FIFO is always empty */
++    if (0 < tx_thr) {
++        raw |= UART_INT_TXFIFO_EMPTY;
++    }
++    return raw;
++}
++
++static void uart_update_irq(Esp32s31State *s)
++{
++    esp32s31_set_source(s, S31_SRC_UART0,
++                        (uart_raw(s) & s->uart_int_ena) != 0);
++}
++
++static uint64_t uart_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++    uint32_t val = 0;
++
++    switch (addr) {
++    case UART_FIFO:
++        if (s->rx_count) {
++            val = s->rx_fifo[s->rx_head];
++            s->rx_head = (s->rx_head + 1) % sizeof(s->rx_fifo);
++            s->rx_count--;
++            qemu_chr_fe_accept_input(&s->chr);
++            uart_update_irq(s);
++        }
++        break;
++    case UART_INT_RAW:
++        val = uart_raw(s);
++        break;
++    case UART_INT_ST:
++        val = uart_raw(s) & s->uart_int_ena;
++        break;
++    case UART_INT_ENA:
++        val = s->uart_int_ena;
++        break;
++    case UART_STATUS:
++        val = s->rx_count;      /* TXFIFO_CNT is always 0 */
++        break;
++    case UART_REG_UPDATE:
++        val = 0;                /* updates complete immediately */
++        break;
++    default:
++        if (addr < sizeof(s->uart_regs)) {
++            val = s->uart_regs[addr / 4];
++        }
++        break;
++    }
++    return val;
++}
++
++static void uart_write(void *opaque, hwaddr addr, uint64_t val,
++                       unsigned size)
++{
++    Esp32s31State *s = opaque;
++    uint8_t ch;
++
++    switch (addr) {
++    case UART_FIFO:
++        ch = val;
++        qemu_chr_fe_write_all(&s->chr, &ch, 1);
++        break;
++    case UART_INT_ENA:
++        s->uart_int_ena = val;
++        break;
++    case UART_INT_CLR:
++        s->uart_int_raw &= ~val;
++        break;
++    case UART_CONF0:
++        /* RXFIFO_RST / TXFIFO_RST */
++        if (val & (1u << 17)) {
++            s->rx_count = 0;
++        }
++        s->uart_regs[addr / 4] = val;
++        break;
++    default:
++        if (addr < sizeof(s->uart_regs)) {
++            s->uart_regs[addr / 4] = val;
++        }
++        break;
++    }
++    uart_update_irq(s);
++}
++
++static const MemoryRegionOps uart_ops = {
++    .read = uart_read,
++    .write = uart_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static int uart_can_receive(void *opaque)
++{
++    Esp32s31State *s = opaque;
++
++    return sizeof(s->rx_fifo) - s->rx_count;
++}
++
++static void uart_receive(void *opaque, const uint8_t *buf, int size)
++{
++    Esp32s31State *s = opaque;
++
++    for (int i = 0; i < size && s->rx_count < sizeof(s->rx_fifo); i++) {
++        s->rx_fifo[(s->rx_head + s->rx_count) % sizeof(s->rx_fifo)] = buf[i];
++        s->rx_count++;
++    }
++    uart_update_irq(s);
++}
++
++/* ------------------------------------------------------- LP AON (reset) */
++
++static uint64_t lpaon_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return 0;
++}
++
++static void lpaon_write(void *opaque, hwaddr addr, uint64_t val,
++                        unsigned size)
++{
++    if (addr == 0x3c && (val & (1u << 20))) {
++        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++    }
++}
++
++static const MemoryRegionOps lpaon_ops = {
++    .read = lpaon_read,
++    .write = lpaon_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------------------------- the board */
++
++static void esp32s31_reset(void *opaque)
++{
++    Esp32s31State *s = opaque;
++
++    s->cliccfg = 0;
++    memset(s->clicintip, 0, sizeof(s->clicintip));
++    memset(s->clicintie, 0, sizeof(s->clicintie));
++    memset(s->clicintattr, 0, sizeof(s->clicintattr));
++    memset(s->clicintctl, 0, sizeof(s->clicintctl));
++    memset(s->clic_in, 0, sizeof(s->clic_in));
++    memset(s->intmtx, 0, sizeof(s->intmtx));
++    memset(s->src_level, 0, sizeof(s->src_level));
++    s->st_conf = ST_CONF_UNIT0_WORK_EN;
++    s->st_unit0_op = 0;
++    s->st_int_ena = s->st_int_raw = 0;
++    s->st_loaded = false;
++    timer_del(s->st_timer);
++    s->rx_count = s->rx_head = 0;
++    s->uart_int_ena = s->uart_int_raw = 0;
++    memset(s->uart_regs, 0, sizeof(s->uart_regs));
++    s->uart_regs[UART_CONF1 / 4] = 0x60 | (0x60 << 10);
++}
++
++static const void *fit_image_data(const void *fit, int node, size_t *len)
++{
++    const fdt32_t *p;
++    int plen;
++    const void *data = fdt_getprop(fit, node, "data", &plen);
++
++    if (data) {
++        *len = plen;
++        return data;
++    }
++    p = fdt_getprop(fit, node, "data-size", &plen);
++    if (!p) {
++        return NULL;
++    }
++    *len = fdt32_to_cpu(*p);
++    p = fdt_getprop(fit, node, "data-position", &plen);
++    if (p) {
++        return (const uint8_t *)fit + fdt32_to_cpu(*p);
++    }
++    p = fdt_getprop(fit, node, "data-offset", &plen);
++    if (p) {
++        size_t base = (fdt_totalsize(fit) + 3) & ~3u;
++        return (const uint8_t *)fit + base + fdt32_to_cpu(*p);
++    }
++    return NULL;
++}
++
++static bool fit_load_image(const void *fit, const char *name,
++                           uint32_t *load_out, uint32_t *entry_out)
++{
++    int images = fdt_path_offset(fit, "/images");
++    int node = images < 0 ? -1 : fdt_subnode_offset(fit, images, name);
++    const fdt32_t *p;
++    size_t len;
++
++    if (node < 0) {
++        error_report("esp32s31: FIT image '%s' not found", name);
++        return false;
++    }
++    const void *data = fit_image_data(fit, node, &len);
++    p = fdt_getprop(fit, node, "load", NULL);
++    if (!data || !p) {
++        error_report("esp32s31: FIT image '%s' has no data/load", name);
++        return false;
++    }
++    *load_out = fdt32_to_cpu(*p);
++    p = fdt_getprop(fit, node, "entry", NULL);
++    *entry_out = p ? fdt32_to_cpu(*p) : *load_out;
++    rom_add_blob_fixed(name, data, len, *load_out);
++    info_report("esp32s31: SPL: loaded %s (%zu bytes) at 0x%08x", name, len,
++                *load_out);
++    return true;
++}
++
++/*
++ * What the SPL does: load the U-Boot FIT's default configuration and enter
++ * OpenSBI with fw_dynamic info pointing at U-Boot.
++ */
++static void esp32s31_spl_boot(Esp32s31State *s, const uint8_t *flash,
++                              size_t flash_size)
++{
++    MachineState *ms = MACHINE(s);
++    const void *fit = flash;
++    uint32_t sbi_load, sbi_entry, ub_load, ub_entry, fdt_load, fdt_entry;
++
++    if (flash_size < sizeof(struct fdt_header) || fdt_check_header(fit) ||
++        fdt_totalsize(fit) > flash_size) {
++        error_report("esp32s31: no FIT at flash offset 0x%x", s->xip_offset);
++        exit(1);
++    }
++    int confs = fdt_path_offset(fit, "/configurations");
++    const char *def = confs < 0 ? NULL :
++        fdt_getprop(fit, confs, "default", NULL);
++    int conf = def ? fdt_subnode_offset(fit, confs, def) : -1;
++    if (conf < 0) {
++        error_report("esp32s31: FIT has no default configuration");
++        exit(1);
++    }
++    const char *fw = fdt_getprop(fit, conf, "firmware", NULL);
++    const char *ld = fdt_getprop(fit, conf, "loadables", NULL);
++    const char *fdtn = fdt_getprop(fit, conf, "fdt", NULL);
++    if (!fw || !ld || !fdtn ||
++        !fit_load_image(fit, fw, &sbi_load, &sbi_entry) ||
++        !fit_load_image(fit, ld, &ub_load, &ub_entry) ||
++        !fit_load_image(fit, fdtn, &fdt_load, &fdt_entry)) {
++        exit(1);
++    }
++
++    riscv_setup_rom_reset_vec(ms, &s->cpus, sbi_entry,
++                              S31_RESETVEC_BASE, S31_RESETVEC_SIZE,
++                              ub_entry, fdt_load);
++}
++
++static void esp32s31_machine_init(MachineState *machine)
++{
++    Esp32s31State *s = ESP32S31_MACHINE(machine);
++    MemoryRegion *sysmem = get_system_memory();
++
++    /* CPU */
++    object_initialize_child(OBJECT(machine), "cpus", &s->cpus,
++                            TYPE_RISCV_HART_ARRAY);
++    object_property_set_str(OBJECT(&s->cpus), "cpu-type", machine->cpu_type,
++                            &error_abort);
++    object_property_set_int(OBJECT(&s->cpus), "num-harts", 1, &error_abort);
++    object_property_set_int(OBJECT(&s->cpus), "resetvec", S31_RESETVEC_BASE,
++                            &error_abort);
++    sysbus_realize(SYS_BUS_DEVICE(&s->cpus), &error_fatal);
++    for (int i = 0; i < s->cpus.num_harts; i++) {
++        CPURISCVState *env = &s->cpus.harts[i].env;
++
++        env->clic_mode = true;
++        env->clic_opaque = s;
++        env->clic_highest = esp32s31_clic_highest;
++    }
++
++    /* Memories */
++    memory_region_init_ram(&s->lpram, NULL, "esp32s31.lpram", S31_LPRAM_SIZE,
++                           &error_fatal);
++    memory_region_add_subregion(sysmem, S31_LPRAM_BASE, &s->lpram);
++    memory_region_init_ram(&s->hpram, NULL, "esp32s31.hpram", S31_HPRAM_SIZE,
++                           &error_fatal);
++    memory_region_add_subregion(sysmem, S31_HPRAM_BASE, &s->hpram);
++    memory_region_init_ram(&s->psram, NULL, "esp32s31.psram", S31_PSRAM_SIZE,
++                           &error_fatal);
++    memory_region_add_subregion(sysmem, S31_PSRAM_BASE, &s->psram);
++
++    /* Mask ROM: every word is "ret" */
++    memory_region_init_rom(&s->mrom, NULL, "esp32s31.mrom", S31_MROM_SIZE,
++                           &error_fatal);
++    uint32_t *rom = memory_region_get_ram_ptr(&s->mrom);
++    for (unsigned i = 0; i < S31_MROM_SIZE / 4; i++) {
++        rom[i] = cpu_to_le32(0x00008067);   /* jalr x0, 0(ra) */
++    }
++    memory_region_add_subregion(sysmem, S31_MROM_BASE, &s->mrom);
++
++    memory_region_init_rom(&s->resetvec, NULL, "esp32s31.resetvec",
++                           S31_RESETVEC_SIZE, &error_fatal);
++    memory_region_add_subregion(sysmem, S31_RESETVEC_BASE, &s->resetvec);
++
++    /* Flash XIP window */
++    memory_region_init_rom(&s->flash, NULL, "esp32s31.flash", S31_FLASH_SIZE,
++                           &error_fatal);
++    uint8_t *flash = memory_region_get_ram_ptr(&s->flash);
++    memset(flash, 0xff, S31_FLASH_SIZE);
++    memory_region_add_subregion(sysmem, S31_FLASH_BASE, &s->flash);
++
++    /* Peripherals */
++    create_unimplemented_device("esp32s31.periph", S31_PERIPH_BASE,
++                                S31_PERIPH_SIZE);
++    memory_region_init_io(&s->clic_m_mr, NULL, &clic_m_ops, s,
++                          "esp32s31.clic-m", S31_CLIC_SIZE);
++    memory_region_add_subregion(sysmem, S31_CLIC_M_BASE, &s->clic_m_mr);
++    memory_region_init_io(&s->clic_s_mr, NULL, &clic_s_ops, s,
++                          "esp32s31.clic-s", S31_CLIC_SIZE);
++    memory_region_add_subregion(sysmem, S31_CLIC_S_BASE, &s->clic_s_mr);
++    memory_region_init_io(&s->intmtx_mr, NULL, &intmtx_ops, s,
++                          "esp32s31.intmtx", S31_INTMTX_SIZE);
++    memory_region_add_subregion(sysmem, S31_INTMTX_BASE, &s->intmtx_mr);
++    memory_region_init_io(&s->systimer_mr, NULL, &systimer_ops, s,
++                          "esp32s31.systimer", S31_SYSTIMER_SIZE);
++    memory_region_add_subregion(sysmem, S31_SYSTIMER_BASE, &s->systimer_mr);
++    memory_region_init_io(&s->uart_mr, NULL, &uart_ops, s,
++                          "esp32s31.uart0", S31_UART_SIZE);
++    memory_region_add_subregion(sysmem, S31_UART0_BASE, &s->uart_mr);
++    memory_region_init_io(&s->lpaon_mr, NULL, &lpaon_ops, s,
++                          "esp32s31.lpaon", S31_LPAON_SIZE);
++    memory_region_add_subregion(sysmem, S31_LPAON_BASE, &s->lpaon_mr);
++
++    s->st_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, systimer_timer_cb, s);
++
++    qemu_chr_fe_init(&s->chr, serial_hd(0), &error_fatal);
++    qemu_chr_fe_set_handlers(&s->chr, uart_can_receive, uart_receive,
++                             NULL, NULL, s, NULL, true);
++
++    /* The time CSR, used by OpenSBI to emulate S-mode rdtime. */
++    riscv_aclint_mtimer_create(S31_MTIMER_BASE,
++            RISCV_ACLINT_DEFAULT_MTIMER_SIZE, 0, s->cpus.num_harts,
++            RISCV_ACLINT_DEFAULT_MTIMECMP, RISCV_ACLINT_DEFAULT_MTIME,
++            S31_TIMEBASE_FREQ, true);
++
++    qemu_register_reset(esp32s31_reset, s);
++    esp32s31_reset(s);
++
++    if (s->flash_file) {
++        int64_t size = get_image_size(s->flash_file, NULL);
++
++        if (size <= 0) {
++            error_report("esp32s31: can't read flash image '%s'",
++                         s->flash_file);
++            exit(1);
++        }
++        g_autofree uint8_t *img = g_malloc(size);
++        if (load_image_size(s->flash_file, img, size) != size) {
++            error_report("esp32s31: can't load flash image '%s'",
++                         s->flash_file);
++            exit(1);
++        }
++        if (size > s->xip_offset) {
++            size_t n = MIN((size_t)(size - s->xip_offset),
++                           (size_t)S31_FLASH_SIZE);
++            memcpy(flash, img + s->xip_offset, n);
++        }
++        if (!machine->firmware) {
++            esp32s31_spl_boot(s, flash, S31_FLASH_SIZE);
++            return;
++        }
++    }
++
++    if (machine->firmware) {
++        RISCVBootInfo boot_info;
++        hwaddr fw_end, fw_load = S31_HPRAM_BASE;
++        uint64_t kernel_entry = 0;
++
++        riscv_boot_info_init(&boot_info, &s->cpus);
++        fw_end = riscv_load_firmware(machine, &boot_info, machine->firmware,
++                                     &fw_load, NULL);
++        if (machine->kernel_filename) {
++            riscv_load_kernel(machine, &boot_info, S31_PSRAM_BASE, false,
++                              NULL);
++            kernel_entry = boot_info.image_low_addr;
++        }
++        (void)fw_end;
++        riscv_setup_rom_reset_vec(machine, &s->cpus, fw_load,
++                                  S31_RESETVEC_BASE, S31_RESETVEC_SIZE,
++                                  kernel_entry, 0);
++    }
++}
++
++static char *esp32s31_get_flash(Object *obj, Error **errp)
++{
++    return g_strdup(ESP32S31_MACHINE(obj)->flash_file);
++}
++
++static void esp32s31_set_flash(Object *obj, const char *val, Error **errp)
++{
++    Esp32s31State *s = ESP32S31_MACHINE(obj);
++
++    g_free(s->flash_file);
++    s->flash_file = g_strdup(val);
++}
++
++static void esp32s31_get_xip_offset(Object *obj, Visitor *v, const char *name,
++                                    void *opaque, Error **errp)
++{
++    Esp32s31State *s = ESP32S31_MACHINE(obj);
++
++    visit_type_uint32(v, name, &s->xip_offset, errp);
++}
++
++static void esp32s31_set_xip_offset(Object *obj, Visitor *v, const char *name,
++                                    void *opaque, Error **errp)
++{
++    Esp32s31State *s = ESP32S31_MACHINE(obj);
++
++    visit_type_uint32(v, name, &s->xip_offset, errp);
++}
++
++static void esp32s31_machine_instance_init(Object *obj)
++{
++    Esp32s31State *s = ESP32S31_MACHINE(obj);
++
++    s->xip_offset = 0x100000;
++}
++
++static void esp32s31_machine_class_init(ObjectClass *oc, const void *data)
++{
++    MachineClass *mc = MACHINE_CLASS(oc);
++    static const char * const valid_cpu_types[] = {
++        TYPE_RISCV_CPU_ESP32S31,
++        NULL
++    };
++
++    mc->desc = "Espressif ESP32-S31 (HP core 0)";
++    mc->init = esp32s31_machine_init;
++    mc->max_cpus = 1;
++    mc->default_cpu_type = TYPE_RISCV_CPU_ESP32S31;
++    mc->valid_cpu_types = valid_cpu_types;
++
++    object_class_property_add_str(oc, "flash", esp32s31_get_flash,
++                                  esp32s31_set_flash);
++    object_class_property_set_description(oc, "flash",
++        "Raw image of the 16MiB SPI NOR flash (s31_full_flash.bin)");
++    object_class_property_add(oc, "xip-offset", "uint32",
++                              esp32s31_get_xip_offset,
++                              esp32s31_set_xip_offset, NULL, NULL);
++    object_class_property_set_description(oc, "xip-offset",
++        "Raw flash offset the SPL maps at 0x40000000 (default 0x100000)");
++}
++
++static const TypeInfo esp32s31_machine_typeinfo = {
++    .name = TYPE_ESP32S31_MACHINE,
++    .parent = TYPE_MACHINE,
++    .class_init = esp32s31_machine_class_init,
++    .instance_init = esp32s31_machine_instance_init,
++    .instance_size = sizeof(Esp32s31State),
++    .interfaces = riscv32_machine_interfaces,
++};
++
++static void esp32s31_machine_register_types(void)
++{
++    type_register_static(&esp32s31_machine_typeinfo);
++}
++
++type_init(esp32s31_machine_register_types)
+diff --git a/hw/riscv/meson.build b/hw/riscv/meson.build
+index 0d82cea..8c2f783 100644
+--- a/hw/riscv/meson.build
++++ b/hw/riscv/meson.build
+@@ -7,6 +7,7 @@ riscv_ss.add(files('riscv_hart.c'))
+ riscv_ss.add(when: 'CONFIG_OPENTITAN', if_true: files('opentitan.c'))
+ riscv_ss.add(when: 'CONFIG_RISCV_VIRT', if_true: files('virt.c'))
+ riscv_ss.add(when: 'CONFIG_SHAKTI_C', if_true: files('shakti_c.c'))
++riscv_ss.add(when: 'CONFIG_ESP32S31', if_true: files('esp32s31.c'))
+ riscv_ss.add(when: 'CONFIG_SIFIVE_E', if_true: files('sifive_e.c'))
+ riscv_ss.add(when: 'CONFIG_SIFIVE_U', if_true: files('sifive_u.c'))
+ riscv_ss.add(when: 'CONFIG_SPIKE', if_true: files('spike.c'))
+diff --git a/target/riscv/cpu-qom.h b/target/riscv/cpu-qom.h
+index 1a28f13..f07e3b7 100644
+--- a/target/riscv/cpu-qom.h
++++ b/target/riscv/cpu-qom.h
+@@ -43,6 +43,7 @@
+ #define TYPE_RISCV_CPU_RVA23U64         RISCV_CPU_TYPE_NAME("rva23u64")
+ #define TYPE_RISCV_CPU_RVA23S64         RISCV_CPU_TYPE_NAME("rva23s64")
+ #define TYPE_RISCV_CPU_IBEX             RISCV_CPU_TYPE_NAME("lowrisc-ibex")
++#define TYPE_RISCV_CPU_ESP32S31         RISCV_CPU_TYPE_NAME("esp32s31")
+ #define TYPE_RISCV_CPU_SHAKTI_C         RISCV_CPU_TYPE_NAME("shakti-c")
+ #define TYPE_RISCV_CPU_SIFIVE_E         RISCV_CPU_TYPE_NAME("sifive-e")
+ #define TYPE_RISCV_CPU_SIFIVE_E31       RISCV_CPU_TYPE_NAME("sifive-e31")
+diff --git a/target/riscv/cpu.c b/target/riscv/cpu.c
+index b04beee..0f0de32 100644
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -956,6 +956,14 @@ bool riscv_cpu_has_work(CPUState *cs)
+ {
+     RISCVCPU *cpu = RISCV_CPU(cs);
+     CPURISCVState *env = &cpu->env;
++    if (env->clic_mode) {
++        /* wfi wakes on any pending and enabled CLIC input */
++        int id, mode;
++        uint8_t level;
++
++        return env->clic_highest &&
++               env->clic_highest(env->clic_opaque, &id, &level, &mode);
++    }
+     /*
+      * Definition of the WFI instruction requires it to ignore the privilege
+      * mode and delegation registers, but respect individual enables
+@@ -1009,6 +1017,8 @@ static void riscv_cpu_reset_hold(Object *obj, ResetType type)
+     env->mstatus = set_field(env->mstatus, MSTATUS_SBE, cpu->cfg.big_endian);
+     env->mstatus = set_field(env->mstatus, MSTATUS_UBE, cpu->cfg.big_endian);
+     env->mcause = 0;
++    env->clic_mil = 0;
++    env->clic_sil = 0;
+     env->miclaim = MIP_SGEIP;
+     env->pc = env->resetvec;
+     env->bins = 0;
+@@ -3313,6 +3323,29 @@ static const TypeInfo riscv_cpu_type_infos[] = {
+         .cfg.ext_xlrbr = true
+     ),
+ 
++    /* Espressif ESP32-S31 HP core: RV32IMAFC + Zb*, Sv32, CLIC mode */
++    DEFINE_RISCV_CPU(TYPE_RISCV_CPU_ESP32S31, TYPE_RISCV_VENDOR_CPU,
++        .misa_mxl_max = MXL_RV32,
++        .misa_ext = RVI | RVM | RVA | RVF | RVC | RVS | RVU,
++        .priv_spec = PRIV_VERSION_1_12_0,
++        .cfg.mmu = true,
++        .cfg.pmp = true,
++        .cfg.ext_zifencei = true,
++        .cfg.ext_zicsr = true,
++        .cfg.ext_zicntr = true,
++        .cfg.ext_zba = true,
++        .cfg.ext_zbb = true,
++        .cfg.ext_zbc = true,
++        .cfg.ext_zbs = true,
++        .cfg.mvendorid = 0x612,
++        .cfg.marchid = 0x80000003,
++        .cfg.mimpid = 1,
++        .cfg.max_satp_mode = VM_1_10_SV32,
++#if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
++        .custom_csrs = esp_csr_list,
++#endif
++    ),
++
+     DEFINE_RISCV_CPU(TYPE_RISCV_CPU_SIFIVE_E31, TYPE_RISCV_CPU_SIFIVE_E,
+         .misa_mxl_max = MXL_RV32
+     ),
+diff --git a/target/riscv/cpu.h b/target/riscv/cpu.h
+index e980b59..e0caa9c 100644
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -330,6 +330,22 @@ struct CPUArchState {
+     bool external_seip;
+     bool software_seip;
+ 
++#ifndef CONFIG_USER_ONLY
++    /*
++     * Espressif-style CLIC operating in "CLIC mode" (e.g. ESP32-S31):
++     * interrupts are not delivered through mip/mie; instead each CLIC input
++     * traps with xcause.exccode = input id.  xtvec[5:0] read as 0b000011,
++     * xcause carries xinhv/xpp/xpie/xpil, and xret restores the interrupt
++     * level from xcause.xpil (only for interrupt-type xcause values, as on
++     * the ESP32-S31).
++     */
++    bool clic_mode;
++    uint8_t clic_mil;           /* M-mode current interrupt level */
++    uint8_t clic_sil;           /* S-mode current interrupt level */
++    void *clic_opaque;
++    bool (*clic_highest)(void *opaque, int *id, uint8_t *level, int *mode);
++#endif
++
+     uint64_t miclaim;
+ 
+     uint64_t mie;
+diff --git a/target/riscv/tcg/cpu_helper.c b/target/riscv/tcg/cpu_helper.c
+index 07d9222..4c25bbb 100644
+--- a/target/riscv/tcg/cpu_helper.c
++++ b/target/riscv/tcg/cpu_helper.c
+@@ -330,12 +330,55 @@ int riscv_cpu_hviprio_index2irq(int index, int *out_irq, int *out_rdzero)
+     return 0;
+ }
+ 
++/*
++ * CLIC mode: pick the CLIC input to take, if any.  Inputs targeting a
++ * more privileged mode always preempt; within the same mode, an input is
++ * taken only when globally enabled and its level exceeds the current one.
++ */
++static int riscv_cpu_clic_irq_pending(CPURISCVState *env, int *out_mode,
++                                      uint8_t *out_level)
++{
++    int id, mode;
++    uint8_t level;
++
++    if (!env->clic_highest ||
++        !env->clic_highest(env->clic_opaque, &id, &level, &mode)) {
++        return RISCV_EXCP_NONE;
++    }
++
++    if (mode == PRV_M) {
++        if (env->priv == PRV_M &&
++            (!get_field(env->mstatus, MSTATUS_MIE) || level <= env->clic_mil)) {
++            return RISCV_EXCP_NONE;
++        }
++    } else {
++        if (env->priv > PRV_S) {
++            return RISCV_EXCP_NONE;
++        }
++        if (env->priv == PRV_S &&
++            (!get_field(env->mstatus, MSTATUS_SIE) || level <= env->clic_sil)) {
++            return RISCV_EXCP_NONE;
++        }
++    }
++    if (out_mode) {
++        *out_mode = mode;
++    }
++    if (out_level) {
++        *out_level = level;
++    }
++    return id;
++}
++
+ static int riscv_cpu_local_irq_pending(CPURISCVState *env)
+ {
+     uint64_t irqs, pending, mie, hsie, vsie, irqs_f, irqs_f_vs;
+     uint64_t vsbits, irq_delegated;
+     int virq;
+ 
++    if (env->clic_mode) {
++        return riscv_cpu_clic_irq_pending(env, NULL, NULL);
++    }
++
+     /* Priority: RNMI > Other interrupt. */
+     if (riscv_cpu_cfg(env)->ext_smrnmi) {
+         /* If mnstatus.NMIE == 0, all interrupts are disabled. */
+@@ -567,6 +610,19 @@ void riscv_cpu_interrupt(CPURISCVState *env)
+ 
+     vstip = env->vstime_irq ? MIP_VSTIP : 0;
+ 
++    if (env->clic_mode) {
++        int id, mode;
++        uint8_t level;
++
++        if (env->clic_highest &&
++            env->clic_highest(env->clic_opaque, &id, &level, &mode)) {
++            cpu_interrupt(cs, CPU_INTERRUPT_HARD);
++        } else {
++            cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
++        }
++        return;
++    }
++
+     if (env->mip | vsgein | vstip | irqf) {
+         cpu_interrupt(cs, CPU_INTERRUPT_HARD);
+     } else {
+@@ -2181,6 +2237,25 @@ void riscv_cpu_do_interrupt(CPUState *cs)
+     mode = env->priv <= PRV_S && cause < 64 &&
+         (((deleg >> cause) & 1) || s_injected || vs_injected) ? PRV_S : PRV_M;
+ 
++    uint8_t clic_level = 0;
++    if (env->clic_mode) {
++        if (async) {
++            int clic_mode_target = PRV_M;
++            int id = riscv_cpu_clic_irq_pending(env, &clic_mode_target,
++                                                &clic_level);
++            if (id < 0) {
++                /* Went away (e.g. masked) before we got here. */
++                return;
++            }
++            cause = id;
++            mode = clic_mode_target;
++        } else {
++            /* Synchronous exceptions: delegation by medeleg only. */
++            mode = env->priv <= PRV_S && cause < 64 &&
++                ((env->medeleg >> cause) & 1) ? PRV_S : PRV_M;
++        }
++    }
++
+     vsmode_exc = env->virt_enabled && cause < 64 &&
+         (((hdeleg >> cause) & 1) || vs_injected);
+ 
+@@ -2260,6 +2335,14 @@ void riscv_cpu_do_interrupt(CPUState *cs)
+         env->htinst = tinst;
+         env->pc = (env->stvec >> 2 << 2) +
+                   ((async && (env->stvec & 3) == 1) ? cause * 4 : 0);
++        if (env->clic_mode) {
++            /* scause.spil = previous level; non-vectored, 64B aligned */
++            env->scause |= (target_ulong)env->clic_sil << 16;
++            if (async) {
++                env->clic_sil = clic_level;
++            }
++            env->pc = env->stvec & ~(target_ulong)0x3f;
++        }
+         riscv_cpu_set_mode(env, PRV_S, virt);
+ 
+         src = env->sepc;
+@@ -2326,6 +2409,12 @@ void riscv_cpu_do_interrupt(CPUState *cs)
+         }
+         env->mstatus = s;
+         env->mcause = cause | ((target_ulong)async << (mxlen - 1));
++        if (env->clic_mode) {
++            env->mcause |= (target_ulong)env->clic_mil << 16;
++            if (async) {
++                env->clic_mil = clic_level;
++            }
++        }
+         if (smode_double_trap) {
+             env->mtval2 = env->mcause;
+             env->mcause = RISCV_EXCP_DOUBLE_TRAP;
+@@ -2345,6 +2434,9 @@ void riscv_cpu_do_interrupt(CPUState *cs)
+         } else {
+             env->pc = (env->mtvec >> 2 << 2) +
+                       ((async && (env->mtvec & 3) == 1) ? cause * 4 : 0);
++            if (env->clic_mode) {
++                env->pc = env->mtvec & ~(target_ulong)0x3f;
++            }
+         }
+         riscv_cpu_set_mode(env, PRV_M, virt);
+         src = env->mepc;
+diff --git a/target/riscv/tcg/csr.c b/target/riscv/tcg/csr.c
+index a4cd126..e6cac16 100644
+--- a/target/riscv/tcg/csr.c
++++ b/target/riscv/tcg/csr.c
+@@ -3042,6 +3042,11 @@ static RISCVException read_mtvec(CPURISCVState *env, int csrno,
+ static RISCVException write_mtvec(CPURISCVState *env, int csrno,
+                                   target_ulong val, uintptr_t ra)
+ {
++    if (env->clic_mode) {
++        /* CLIC mode: mode bits read as 3, base is 64 byte aligned */
++        env->mtvec = (val & ~(target_ulong)0x3f) | 3;
++        return RISCV_EXCP_NONE;
++    }
+     /* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */
+     if ((val & 3) < 2) {
+         env->mtvec = val;
+@@ -3178,10 +3183,25 @@ static RISCVException write_mepc(CPURISCVState *env, int csrno,
+     return RISCV_EXCP_NONE;
+ }
+ 
++/*
++ * CLIC mode: mcause.mpp (29:28) and mcause.mpie (27) are aliases of the
++ * corresponding mstatus fields; scause.spp (28) and scause.spie (27) of
++ * the sstatus ones.
++ */
++#define CLIC_MCAUSE_MPP     (3ULL << 28)
++#define CLIC_MCAUSE_MPIE    (1ULL << 27)
++#define CLIC_SCAUSE_SPP     (1ULL << 28)
++#define CLIC_SCAUSE_SPIE    (1ULL << 27)
++
+ static RISCVException read_mcause(CPURISCVState *env, int csrno,
+                                   target_ulong *val)
+ {
+     *val = env->mcause;
++    if (env->clic_mode) {
++        *val &= ~(target_ulong)(CLIC_MCAUSE_MPP | CLIC_MCAUSE_MPIE);
++        *val |= (target_ulong)get_field(env->mstatus, MSTATUS_MPP) << 28;
++        *val |= (target_ulong)get_field(env->mstatus, MSTATUS_MPIE) << 27;
++    }
+     return RISCV_EXCP_NONE;
+ }
+ 
+@@ -3189,6 +3209,10 @@ static RISCVException write_mcause(CPURISCVState *env, int csrno,
+                                    target_ulong val, uintptr_t ra)
+ {
+     env->mcause = val;
++    if (env->clic_mode) {
++        env->mstatus = set_field(env->mstatus, MSTATUS_MPP, (val >> 28) & 3);
++        env->mstatus = set_field(env->mstatus, MSTATUS_MPIE, (val >> 27) & 1);
++    }
+     return RISCV_EXCP_NONE;
+ }
+ 
+@@ -4174,6 +4198,11 @@ static RISCVException rmw_sie(CPURISCVState *env, int csrno,
+     uint64_t rval;
+     RISCVException ret;
+ 
++    if (env->clic_mode && env->priv == PRV_S) {
++        /* not implemented in CLIC mode; the SBI emulates it */
++        return RISCV_EXCP_ILLEGAL_INST;
++    }
++
+     ret = rmw_sie64(env, csrno, &rval, new_val, wr_mask);
+     if (ret == RISCV_EXCP_NONE && ret_val) {
+         *ret_val = rval;
+@@ -4208,6 +4237,11 @@ static RISCVException read_stvec(CPURISCVState *env, int csrno,
+ static RISCVException write_stvec(CPURISCVState *env, int csrno,
+                                   target_ulong val, uintptr_t ra)
+ {
++    if (env->clic_mode) {
++        /* CLIC mode: mode bits read as 3, base is 64 byte aligned */
++        env->stvec = (val & ~(target_ulong)0x3f) | 3;
++        return RISCV_EXCP_NONE;
++    }
+     /* bits [1:0] encode mode; 0 = direct, 1 = vectored, 2 >= reserved */
+     if ((val & 3) < 2) {
+         env->stvec = val;
+@@ -4283,6 +4317,11 @@ static RISCVException read_scause(CPURISCVState *env, int csrno,
+                                   target_ulong *val)
+ {
+     *val = env->scause;
++    if (env->clic_mode) {
++        *val &= ~(target_ulong)(CLIC_SCAUSE_SPP | CLIC_SCAUSE_SPIE);
++        *val |= (target_ulong)get_field(env->mstatus, MSTATUS_SPP) << 28;
++        *val |= (target_ulong)get_field(env->mstatus, MSTATUS_SPIE) << 27;
++    }
+     return RISCV_EXCP_NONE;
+ }
+ 
+@@ -4290,6 +4329,10 @@ static RISCVException write_scause(CPURISCVState *env, int csrno,
+                                    target_ulong val, uintptr_t ra)
+ {
+     env->scause = val;
++    if (env->clic_mode) {
++        env->mstatus = set_field(env->mstatus, MSTATUS_SPP, (val >> 28) & 1);
++        env->mstatus = set_field(env->mstatus, MSTATUS_SPIE, (val >> 27) & 1);
++    }
+     return RISCV_EXCP_NONE;
+ }
+ 
+@@ -4404,6 +4447,11 @@ static RISCVException rmw_sip(CPURISCVState *env, int csrno,
+     uint64_t rval;
+     RISCVException ret;
+ 
++    if (env->clic_mode && env->priv == PRV_S) {
++        /* not implemented in CLIC mode; the SBI emulates it */
++        return RISCV_EXCP_ILLEGAL_INST;
++    }
++
+     ret = rmw_sip64(env, csrno, &rval, new_val, wr_mask);
+     if (ret_val) {
+         *ret_val = rval;
+diff --git a/target/riscv/tcg/csr.h b/target/riscv/tcg/csr.h
+index 53ba3b4..b748991 100644
+--- a/target/riscv/tcg/csr.h
++++ b/target/riscv/tcg/csr.h
+@@ -87,6 +87,9 @@ extern const RISCVCSR th_csr_list[];
+ /* Implemented in mips_csr.c */
+ extern const RISCVCSR mips_csr_list[];
+ 
++/* Implemented in esp_csr.c */
++extern const RISCVCSR esp_csr_list[];
++
+ /* PMP CSRs, defined in pmp.c */
+ void pmpcfg_csr_write(CPURISCVState *env, uint32_t reg_index,
+                       target_ulong val);
+diff --git a/target/riscv/tcg/esp_csr.c b/target/riscv/tcg/esp_csr.c
+new file mode 100644
+index 0000000..c1ae067
+--- /dev/null
++++ b/target/riscv/tcg/esp_csr.c
+@@ -0,0 +1,70 @@
++/*
++ * Espressif ESP32-S31 vendor CSRs.
++ *
++ * The chip has a PMA (physical memory attribute) unit configured through
++ * 16 pmacfg (0xbc0-0xbcf) and 16 pmaaddr (0xbd0-0xbdf) M-mode CSRs.  QEMU
++ * doesn't model PMAs; just provide storage so firmware runs.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "cpu.h"
++#include "target/riscv/tcg/csr.h"
++
++#define CSR_ESP_PMACFG0     0xbc0
++#define CSR_ESP_PMAADDR0    0xbd0
++#define ESP_NPMA            16
++
++static target_ulong esp_pma_regs[2 * ESP_NPMA];
++
++static RISCVException esp_mmode(CPURISCVState *env, int csrno)
++{
++    return RISCV_EXCP_NONE;
++}
++
++static bool test_esp_mvendorid(RISCVCPU *cpu)
++{
++    return cpu->cfg.mvendorid == 0x612;
++}
++
++static RISCVException read_esp_pma(CPURISCVState *env, int csrno,
++                                   target_ulong *val)
++{
++    *val = esp_pma_regs[csrno - CSR_ESP_PMACFG0];
++    return RISCV_EXCP_NONE;
++}
++
++static RISCVException write_esp_pma(CPURISCVState *env, int csrno,
++                                    target_ulong val, uintptr_t ra)
++{
++    esp_pma_regs[csrno - CSR_ESP_PMACFG0] = val;
++    return RISCV_EXCP_NONE;
++}
++
++#define ESP_PMA_CSR(n, name) \
++    { \
++        .csrno = (n), \
++        .insertion_test = test_esp_mvendorid, \
++        .csr_ops = { name, esp_mmode, read_esp_pma, write_esp_pma } \
++    }
++
++const RISCVCSR esp_csr_list[] = {
++    ESP_PMA_CSR(0xbc0, "esp.pmacfg0"),  ESP_PMA_CSR(0xbc1, "esp.pmacfg1"),
++    ESP_PMA_CSR(0xbc2, "esp.pmacfg2"),  ESP_PMA_CSR(0xbc3, "esp.pmacfg3"),
++    ESP_PMA_CSR(0xbc4, "esp.pmacfg4"),  ESP_PMA_CSR(0xbc5, "esp.pmacfg5"),
++    ESP_PMA_CSR(0xbc6, "esp.pmacfg6"),  ESP_PMA_CSR(0xbc7, "esp.pmacfg7"),
++    ESP_PMA_CSR(0xbc8, "esp.pmacfg8"),  ESP_PMA_CSR(0xbc9, "esp.pmacfg9"),
++    ESP_PMA_CSR(0xbca, "esp.pmacfg10"), ESP_PMA_CSR(0xbcb, "esp.pmacfg11"),
++    ESP_PMA_CSR(0xbcc, "esp.pmacfg12"), ESP_PMA_CSR(0xbcd, "esp.pmacfg13"),
++    ESP_PMA_CSR(0xbce, "esp.pmacfg14"), ESP_PMA_CSR(0xbcf, "esp.pmacfg15"),
++    ESP_PMA_CSR(0xbd0, "esp.pmaaddr0"),  ESP_PMA_CSR(0xbd1, "esp.pmaaddr1"),
++    ESP_PMA_CSR(0xbd2, "esp.pmaaddr2"),  ESP_PMA_CSR(0xbd3, "esp.pmaaddr3"),
++    ESP_PMA_CSR(0xbd4, "esp.pmaaddr4"),  ESP_PMA_CSR(0xbd5, "esp.pmaaddr5"),
++    ESP_PMA_CSR(0xbd6, "esp.pmaaddr6"),  ESP_PMA_CSR(0xbd7, "esp.pmaaddr7"),
++    ESP_PMA_CSR(0xbd8, "esp.pmaaddr8"),  ESP_PMA_CSR(0xbd9, "esp.pmaaddr9"),
++    ESP_PMA_CSR(0xbda, "esp.pmaaddr10"), ESP_PMA_CSR(0xbdb, "esp.pmaaddr11"),
++    ESP_PMA_CSR(0xbdc, "esp.pmaaddr12"), ESP_PMA_CSR(0xbdd, "esp.pmaaddr13"),
++    ESP_PMA_CSR(0xbde, "esp.pmaaddr14"), ESP_PMA_CSR(0xbdf, "esp.pmaaddr15"),
++    { }
++};
+diff --git a/target/riscv/tcg/meson.build b/target/riscv/tcg/meson.build
+index a05ab64..f63127a 100644
+--- a/target/riscv/tcg/meson.build
++++ b/target/riscv/tcg/meson.build
+@@ -20,6 +20,7 @@ riscv_ss.add(files(
+ 
+ riscv_system_ss.add(files(
+   'debug.c',
++  'esp_csr.c',
+   'mips_csr.c',
+   'pmp.c',
+   'pmu.c',
+diff --git a/target/riscv/tcg/op_helper.c b/target/riscv/tcg/op_helper.c
+index 3e94005..a2064a8 100644
+--- a/target/riscv/tcg/op_helper.c
++++ b/target/riscv/tcg/op_helper.c
+@@ -328,6 +328,16 @@ target_ulong helper_sret(CPURISCVState *env)
+         riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, GETPC());
+     }
+ 
++    if (env->clic_mode) {
++        /*
++         * CLIC: restore the S interrupt level from scause.spil.  The
++         * ESP32-S31 only does this when scause is interrupt-type.
++         */
++        if (env->scause & ((target_ulong)1 << (TARGET_LONG_BITS - 1))) {
++            env->clic_sil = (env->scause >> 16) & 0xff;
++        }
++    }
++
+     mstatus = env->mstatus;
+     prev_priv = get_field(mstatus, MSTATUS_SPP);
+     mstatus = set_field(mstatus, MSTATUS_SIE,
+@@ -432,6 +442,11 @@ target_ulong helper_mret(CPURISCVState *env)
+ 
+     check_ret_from_m_mode(env, retpc, prev_priv, ra);
+ 
++    if (env->clic_mode &&
++        (env->mcause & ((target_ulong)1 << (TARGET_LONG_BITS - 1)))) {
++        env->clic_mil = (env->mcause >> 16) & 0xff;
++    }
++
+     bool prev_virt = !!(get_field(env->mstatus, MSTATUS_MPV) &&
+                      (prev_priv != PRV_M));
+     mstatus = set_field(mstatus, MSTATUS_MIE,
+-- 
+2.43.0
+

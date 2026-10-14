@@ -1,0 +1,212 @@
+From 3fee2e9e74c5ff7a29a543d48f02e2a7e42da502 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Tue, 13 Oct 2026 21:05:28 -0400
+Subject: [PATCH 2/2] hw/riscv/esp32s31: add a TRNG model and an "asid" machine
+ option
+
+- TRNG at 0x20814000: the data register returns guest-random words
+  while the block is clocked and sampling, zero otherwise.
+- asid=on|off (default on): with asid=off, satp.ASID is read-only zero,
+  so guests can be tested against a core without ASID support.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/riscv/esp32s31.c    | 80 +++++++++++++++++++++++++++++++++++++++++-
+ target/riscv/cpu.h     |  1 +
+ target/riscv/tcg/csr.c |  4 +++
+ 3 files changed, 84 insertions(+), 1 deletion(-)
+
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index 2e0a93e..4771bf1 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -35,6 +35,7 @@
+ #include "qemu/log.h"
+ #include "qemu/error-report.h"
+ #include "qemu/timer.h"
++#include "qemu/guest-random.h"
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+ #include "hw/core/boards.h"
+@@ -66,6 +67,7 @@ enum {
+     S31_PERIPH_BASE     = 0x20000000, S31_PERIPH_SIZE = 0x01000000,
+     S31_UART0_BASE      = 0x2038a000, S31_UART_SIZE   = 0x1000,
+     S31_SYSTIMER_BASE   = 0x20399000, S31_SYSTIMER_SIZE = 0x100,
++    S31_TRNG_BASE       = 0x20814000, S31_TRNG_SIZE   = 0x100,
+     S31_INTMTX_BASE     = 0x20585000, S31_INTMTX_SIZE = 0x800,
+     S31_LPAON_BASE      = 0x20701000, S31_LPAON_SIZE  = 0x1000,
+     S31_MTIMER_BASE     = 0x3f000000, /* not on the chip; backs the time CSR */
+@@ -86,11 +88,12 @@ struct Esp32s31State {
+     RISCVHartArrayState cpus;
+     MemoryRegion lpram, hpram, mrom, resetvec, psram, flash;
+     MemoryRegion clic_m_mr, clic_s_mr, intmtx_mr, systimer_mr, uart_mr;
+-    MemoryRegion lpaon_mr;
++    MemoryRegion lpaon_mr, trng_mr;
+ 
+     /* properties */
+     char *flash_file;
+     uint32_t xip_offset;
++    bool asid;
+ 
+     /* CLIC */
+     uint32_t cliccfg;
+@@ -106,6 +109,9 @@ struct Esp32s31State {
+ 
+     /* SYSTIMER */
+     uint32_t st_conf;
++
++    /* TRNG */
++    uint32_t trng_conf, trng_date;
+     uint32_t st_unit0_op;
+     uint32_t st_val_hi, st_val_lo;
+     uint32_t st_target0_hi, st_target0_lo, st_target0_conf;
+@@ -651,6 +657,57 @@ static const MemoryRegionOps lpaon_ops = {
+     .valid = { .min_access_size = 4, .max_access_size = 4 },
+ };
+ 
++/* ------------------------------------------------------------------ TRNG */
++
++#define TRNG_CONF               0x00
++#define TRNG_CONF_SAMPLE_ENABLE (1u << 31)
++#define TRNG_DATA               0x48
++#define TRNG_DATE               0xfc
++#define TRNG_DATE_CLK_EN        (1u << 28)
++
++static uint64_t trng_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++    uint32_t val = 0;
++
++    switch (addr) {
++    case TRNG_CONF:
++        return s->trng_conf;
++    case TRNG_DATE:
++        return s->trng_date;
++    case TRNG_DATA:
++        /* An unclocked or idle block reads back zero. */
++        if ((s->trng_conf & TRNG_CONF_SAMPLE_ENABLE) &&
++            (s->trng_date & TRNG_DATE_CLK_EN)) {
++            qemu_guest_getrandom_nofail(&val, sizeof(val));
++        }
++        return val;
++    }
++    return 0;
++}
++
++static void trng_write(void *opaque, hwaddr addr, uint64_t val,
++                       unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    switch (addr) {
++    case TRNG_CONF:
++        s->trng_conf = val;
++        break;
++    case TRNG_DATE:
++        s->trng_date = val;
++        break;
++    }
++}
++
++static const MemoryRegionOps trng_ops = {
++    .read = trng_read,
++    .write = trng_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
+ /* ------------------------------------------------------------- the board */
+ 
+ static void esp32s31_reset(void *opaque)
+@@ -666,6 +723,8 @@ static void esp32s31_reset(void *opaque)
+     memset(s->intmtx, 0, sizeof(s->intmtx));
+     memset(s->src_level, 0, sizeof(s->src_level));
+     s->st_conf = ST_CONF_UNIT0_WORK_EN;
++    s->trng_conf = 0;
++    s->trng_date = 0;
+     s->st_unit0_op = 0;
+     s->st_int_ena = s->st_int_raw = 0;
+     s->st_loaded = false;
+@@ -787,6 +846,7 @@ static void esp32s31_machine_init(MachineState *machine)
+         CPURISCVState *env = &s->cpus.harts[i].env;
+ 
+         env->clic_mode = true;
++        env->satp_no_asid = !s->asid;
+         env->clic_opaque = s;
+         env->clic_highest = esp32s31_clic_highest;
+     }
+@@ -843,6 +903,9 @@ static void esp32s31_machine_init(MachineState *machine)
+     memory_region_init_io(&s->lpaon_mr, NULL, &lpaon_ops, s,
+                           "esp32s31.lpaon", S31_LPAON_SIZE);
+     memory_region_add_subregion(sysmem, S31_LPAON_BASE, &s->lpaon_mr);
++    memory_region_init_io(&s->trng_mr, NULL, &trng_ops, s,
++                          "esp32s31.trng", S31_TRNG_SIZE);
++    memory_region_add_subregion(sysmem, S31_TRNG_BASE, &s->trng_mr);
+ 
+     s->st_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, systimer_timer_cb, s);
+ 
+@@ -933,11 +996,22 @@ static void esp32s31_set_xip_offset(Object *obj, Visitor *v, const char *name,
+     visit_type_uint32(v, name, &s->xip_offset, errp);
+ }
+ 
++static bool esp32s31_get_asid(Object *obj, Error **errp)
++{
++    return ESP32S31_MACHINE(obj)->asid;
++}
++
++static void esp32s31_set_asid(Object *obj, bool val, Error **errp)
++{
++    ESP32S31_MACHINE(obj)->asid = val;
++}
++
+ static void esp32s31_machine_instance_init(Object *obj)
+ {
+     Esp32s31State *s = ESP32S31_MACHINE(obj);
+ 
+     s->xip_offset = 0x100000;
++    s->asid = true;
+ }
+ 
+ static void esp32s31_machine_class_init(ObjectClass *oc, const void *data)
+@@ -963,6 +1037,10 @@ static void esp32s31_machine_class_init(ObjectClass *oc, const void *data)
+                               esp32s31_set_xip_offset, NULL, NULL);
+     object_class_property_set_description(oc, "xip-offset",
+         "Raw flash offset the SPL maps at 0x40000000 (default 0x100000)");
++    object_class_property_add_bool(oc, "asid", esp32s31_get_asid,
++                                   esp32s31_set_asid);
++    object_class_property_set_description(oc, "asid",
++        "Implement satp.ASID (default on; off = hardwired to zero)");
+ }
+ 
+ static const TypeInfo esp32s31_machine_typeinfo = {
+diff --git a/target/riscv/cpu.h b/target/riscv/cpu.h
+index e0caa9c..ef68ac3 100644
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -340,6 +340,7 @@ struct CPUArchState {
+      * the ESP32-S31).
+      */
+     bool clic_mode;
++    bool satp_no_asid;          /* satp.ASID is hardwired to zero */
+     uint8_t clic_mil;           /* M-mode current interrupt level */
+     uint8_t clic_sil;           /* S-mode current interrupt level */
+     void *clic_opaque;
+diff --git a/target/riscv/tcg/csr.c b/target/riscv/tcg/csr.c
+index e6cac16..5071e9e 100644
+--- a/target/riscv/tcg/csr.c
++++ b/target/riscv/tcg/csr.c
+@@ -4496,6 +4496,10 @@ static RISCVException write_satp(CPURISCVState *env, int csrno,
+     }
+ 
+     env->satp = legalize_xatp(env, env->satp, val);
++    if (env->satp_no_asid) {
++        env->satp &= riscv_cpu_mxl(env) == MXL_RV32 ?
++            ~(target_ulong)SATP32_ASID : ~(target_ulong)SATP64_ASID;
++    }
+     return RISCV_EXCP_NONE;
+ }
+ 
+-- 
+2.43.0
+
