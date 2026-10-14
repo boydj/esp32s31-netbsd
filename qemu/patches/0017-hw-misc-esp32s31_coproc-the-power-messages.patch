@@ -1,0 +1,154 @@
+From a158fb644cd8642be084cb487360bc8fcabc239a Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 16:59:21 -0400
+Subject: [PATCH 17/17] hw/misc/esp32s31_coproc: the power messages
+
+The CPU clock is a number; deep sleep pauses hart 0 and powers off, or
+resets after the time asked for.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/misc/esp32s31_coproc.c         | 66 ++++++++++++++++++++++++++++++-
+ include/hw/misc/esp32s31_coproc.h |  3 ++
+ 2 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/hw/misc/esp32s31_coproc.c b/hw/misc/esp32s31_coproc.c
+index afd31c6..a7a89d6 100644
+--- a/hw/misc/esp32s31_coproc.c
++++ b/hw/misc/esp32s31_coproc.c
+@@ -35,6 +35,8 @@
+ #include "hw/core/sysbus.h"
+ #include "hw/misc/esp32s31_coproc.h"
+ #include "system/address-spaces.h"
++#include "system/runstate.h"
++#include "hw/core/cpu.h"
+ #include "system/dma.h"
+ #include "net/net.h"
+ #include "net/eth.h"
+@@ -78,7 +80,11 @@
+ #define CTL_BT_ENABLE   8
+ #define CTL_BT_DISABLE  9
+ #define CTL_SENSORS     10
++#define CTL_POWER       11
+ #define CAP_SENSORS     4
++#define CAP_POWER       8
++#define POWER_CPUFREQ   1
++#define POWER_OFF       2
+ #define ADC_CHANNELS    16
+ #define EVT_WIFI_LINK   64
+ 
+@@ -509,12 +515,66 @@ static void ctl_input(Esp32s31CoprocState *s, uint8_t type,
+         ctl_reply(s, type, seq, 0, r, sizeof(r));
+         break;
+     }
++    case CTL_POWER: {
++        /*
++         * The CPU clock is a number here; deep sleep is power-off, or
++         * a reset after the time asked for (the LP domain lives on).
++         */
++        const uint32_t op = len >= 4 ? ld32(data) : 0;
++        const uint32_t arg = len >= 8 ? ld32(data + 4) : 0;
++        uint8_t r[20];
++
++        if (op == POWER_OFF) {
++            /* Hart 0 is powered down with the rest. */
++            CPUState *cs = qemu_get_cpu(0);
++
++            if (cs) {
++                cpu_pause(cs);
++            }
++            s->asleep = true;
++            if (arg != 0) {
++                timer_mod(s->wake_timer,
++                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + arg * 1000);
++            } else {
++                qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
++            }
++            break;
++        }
++        if (op != POWER_CPUFREQ) {
++            ctl_reply(s, type, seq, E_OPNOTSUPP, NULL, 0);
++            break;
++        }
++        if (arg != 0 && arg != 320 && arg != 160 && arg != 80) {
++            ctl_reply(s, type, seq, 22, NULL, 0);
++            break;
++        }
++        if (arg != 0) {
++            s->cpu_mhz = arg;
++        }
++        memset(r, 0, sizeof(r));
++        st32(r, s->cpu_mhz);
++        st32(r + 4, 320);
++        st32(r + 8, 160);
++        st32(r + 12, 80);
++        ctl_reply(s, type, seq, 0, r, sizeof(r));
++        break;
++    }
+     default:
+         ctl_reply(s, type, seq, E_OPNOTSUPP, NULL, 0);
+         break;
+     }
+ }
+ 
++static void wake_cb(void *opaque)
++{
++    CPUState *cs = qemu_get_cpu(0);
++
++    if (cs) {
++        cpu_resume(cs);
++    }
++    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++}
++
+ static void h2f_drain(void *opaque)
+ {
+     Esp32s31CoprocState *s = opaque;
+@@ -632,10 +692,13 @@ static void coproc_boot(void *opaque)
+     mac[11]++;
+     mem_write(s->shm + SHM_WIFI_MAC, mac, 12);
+     mem_st32(s->shm + SHM_CAPS, (s->nic ? 1 : 0) |
+-             (qemu_chr_fe_backend_connected(&s->chr) ? 2 : 0) | CAP_SENSORS);
++             (qemu_chr_fe_backend_connected(&s->chr) ? 2 : 0) | CAP_SENSORS |
++             CAP_POWER);
+     mem_st32(s->shm, SHM_MAGIC);
+ 
+     s->running = true;
++    s->cpu_mhz = 320;
++    s->asleep = false;
+     s->wifi_state = WIFI_OFF;
+     s->bt_enabled = false;
+     log_put(s, "I (0) espcp: QEMU stand-in for the radio co-processor\n");
+@@ -746,6 +809,7 @@ static void coproc_realize(DeviceState *dev, Error **errp)
+     s->boot_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, coproc_boot, s);
+     s->assoc_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, wifi_assoc_cb, s);
+     s->beat_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, heartbeat_cb, s);
++    s->wake_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, wake_cb, s);
+ 
+     qemu_macaddr_default_if_unset(&s->conf.macaddr);
+     if (s->conf.peers.ncs[0]) {
+diff --git a/include/hw/misc/esp32s31_coproc.h b/include/hw/misc/esp32s31_coproc.h
+index 18fdfae..b96d7b5 100644
+--- a/include/hw/misc/esp32s31_coproc.h
++++ b/include/hw/misc/esp32s31_coproc.h
+@@ -25,6 +25,7 @@ struct Esp32s31CoprocState {
+     QEMUTimer *boot_timer;
+     QEMUTimer *assoc_timer;
+     QEMUTimer *beat_timer;
++    QEMUTimer *wake_timer;
+ 
+     /* properties */
+     NICConf conf;
+@@ -42,6 +43,8 @@ struct Esp32s31CoprocState {
+     uint32_t shmsize;
+     uint32_t heartbeat;
+ 
++    uint32_t cpu_mhz;
++    bool asleep;
+     uint8_t wifi_state;
+     uint8_t wifi_reason;
+     char cur_ssid[33];
+-- 
+2.43.0
+

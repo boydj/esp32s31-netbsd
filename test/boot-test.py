@@ -53,6 +53,9 @@ ap.add_argument("--uart", action="store_true",
                 help="UART1 through a TCP echo peer (QEMU only)")
 ap.add_argument("--hw", action="store_true",
                 help="sensors, RTC time across a reboot, watchdog reset")
+ap.add_argument("--power", action="store_true",
+                help="CPU clock changes, and power-off as deep sleep with a"
+                     " timed wake-up (which is a reset)")
 ap.add_argument("--persist", action="store_true",
                 help="write to /persist and /etc (flash), check after a reboot")
 ap.add_argument("--crypto", action="store_true",
@@ -399,6 +402,21 @@ if a.hw:
         print("watchdog: FAILED (no reset)", flush=True)
         child.sendcontrol("c")
         child.expect("esp32s31# ")
+if a.power:
+    check("cpu clock", "sysctl -w machdep.cpufreq.cpu0.target=80 >/dev/null"
+          " && sysctl -n machdep.cpufreq.cpu0.current && sysctl -w"
+          " machdep.cpufreq.cpu0.target=320 >/dev/null && sysctl -n"
+          " machdep.cpufreq.cpu0.current | sed 's/^/cpu-/'", "cpu-320", 60)
+    child.sendline("sysctl -w hw.espcp0.poweroff_wake_secs=5 && halt -p")
+    t1 = time.time()
+    try:
+        child.expect("login:", timeout=180)
+        print(f"deep sleep: awake, login after {time.time() - t1:.1f}s",
+              flush=True)
+        child.sendline("root")
+        child.expect("esp32s31# ")
+    except pexpect.TIMEOUT:
+        print("deep sleep: FAILED (no wake-up)", flush=True)
 for n in range(a.reboots):
     child.sendline("reboot")
     t1 = time.time()

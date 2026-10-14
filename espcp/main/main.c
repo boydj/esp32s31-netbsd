@@ -46,6 +46,9 @@ void espcp_ctl_dispatch(uint8_t type, uint32_t seq, const void *data, size_t len
     case ESPCP_CTL_SENSORS:
         espcp_sensors_ctl(type, seq, data, len);
         break;
+    case ESPCP_CTL_POWER:
+        espcp_power_ctl(type, seq, data, len);
+        break;
     default:
         espcp_ctl_reply(type, seq, ESPCP_EOPNOTSUPP, NULL, 0);
         break;
@@ -89,7 +92,8 @@ void app_main(void)
     espcp_bt_init();
     espcp_sensors_init();
 
-    shm->es_caps = ESPCP_CAP_WIFI | ESPCP_CAP_BT | ESPCP_CAP_SENSORS;
+    shm->es_caps = ESPCP_CAP_WIFI | ESPCP_CAP_BT | ESPCP_CAP_SENSORS |
+        ESPCP_CAP_POWER;
     shm->es_heap_free = esp_get_free_heap_size();
     __asm__ volatile("fence rw, rw" ::: "memory");
     shm->es_state = ESPCP_STATE_RUNNING;

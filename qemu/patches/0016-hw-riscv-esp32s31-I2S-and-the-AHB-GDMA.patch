@@ -1,7 +1,7 @@
 From cef6bf1e74a683e2ffdb5b648a8a852ea983673c Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 16:40:49 -0400
-Subject: [PATCH 16/16] hw/riscv/esp32s31: I2S and the AHB GDMA
+Subject: [PATCH 16/17] hw/riscv/esp32s31: I2S and the AHB GDMA
 
 The DMA walks descriptor rings at the sample rate the I2S clock
 registers give: playback data is dropped, capture gets a ramp (left n,

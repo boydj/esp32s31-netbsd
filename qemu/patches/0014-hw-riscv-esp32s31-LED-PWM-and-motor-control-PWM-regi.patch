@@ -1,7 +1,7 @@
 From 20b89fed6b03a5b889593eaa88f0395f17cab7db Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 16:11:10 -0400
-Subject: [PATCH 14/16] hw/riscv/esp32s31: LED PWM and motor control PWM
+Subject: [PATCH 14/17] hw/riscv/esp32s31: LED PWM and motor control PWM
  registers
 
 Plain registers (what's written reads back), enough for drivers to be

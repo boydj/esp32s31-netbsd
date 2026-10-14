@@ -1,7 +1,7 @@
 From 03b440ab160045004dbbc79e641c55c731b400ad Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 07:46:57 -0400
-Subject: [PATCH 08/16] hw/sd: add a Synopsys DesignWare MSHC (dw_mmc) model
+Subject: [PATCH 08/17] hw/sd: add a Synopsys DesignWare MSHC (dw_mmc) model
 
 One card slot on an SD bus, with data moved by the internal DMA
 controller (4-word descriptors, ring or chain mode); the FIFO/PIO path

@@ -1,7 +1,7 @@
 From 4810b7d3fa02d3ca09ec324f877510338ed28df9 Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 16:22:33 -0400
-Subject: [PATCH 15/16] hw/riscv/esp32s31: TWAI, two CTU CAN FD cores on a CAN
+Subject: [PATCH 15/17] hw/riscv/esp32s31: TWAI, two CTU CAN FD cores on a CAN
  bus
 
 QEMU's CTU CAN FD core model for both controllers (without the ESP-only
