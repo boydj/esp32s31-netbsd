@@ -61,6 +61,7 @@ for d in \
     lib/libm \
     lib/libprop \
     lib/libbluetooth \
+    external/bsd/libevent/lib/libevent \
     lib/libbz2 \
     lib/libz
 do

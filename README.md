@@ -186,8 +186,10 @@ Bluetooth is `espbt0` in NetBSD's Bluetooth stack:
 # rfcomm_sppd -a 11:22:33:44:55:66 -s SP      (stdin/stdout over RFCOMM)
 ```
 
-The controller is off until `btconfig ... up`.  Pairing with a PIN needs
-`bthcid`, which isn't in the image yet.
+The controller is off until `btconfig ... up`.  `bthcid` runs from boot
+and answers pairing requests: give it a PIN for a device with
+`btpin -d espbt0 -a 11:22:33:44:55:66 -p 1234`.  Link keys live in
+`/var/db/bthcid.keys`, so they are forgotten at reset.
 
 The firmware's log is in `dmesg` (lines starting `espcp0:`), and
 `vmstat -e | grep espcp` counts its messages.
