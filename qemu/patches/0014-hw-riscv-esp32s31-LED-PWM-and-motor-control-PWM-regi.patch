@@ -1,0 +1,105 @@
+From 20b89fed6b03a5b889593eaa88f0395f17cab7db Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 16:11:10 -0400
+Subject: [PATCH 14/15] hw/riscv/esp32s31: LED PWM and motor control PWM
+ registers
+
+Plain registers (what's written reads back), enough for drivers to be
+exercised and to read back what they programmed; no outputs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/riscv/esp32s31.c | 55 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index dcd8231..29d8a63 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -85,6 +85,9 @@ enum {
+     S31_LPSYS_BASE      = 0x20700000, S31_LPSYS_SIZE  = 0x1000,
+     S31_RTCTIMER_BASE   = 0x20800000, S31_RTCTIMER_SIZE = 0x1000,
+     S31_ZERODET_BASE    = 0x2039a000, S31_ZERODET_SIZE = 0x400,
++    S31_LEDC0_BASE      = 0x20392000, S31_LEDC1_BASE  = 0x2039c000,
++    S31_LEDC_SIZE       = 0x800,
++    S31_MCPWM0_BASE     = 0x20381000, S31_MCPWM_SIZE  = 0x1000,
+     S31_EMAC_BASE       = 0x20350000,
+     S31_USB_BASE        = 0x20300000,
+     S31_USJ_BASE        = 0x20391000, S31_USJ_SIZE    = 0x1000,
+@@ -141,6 +144,12 @@ struct Esp32s31State {
+     uint32_t rtc_regs[0x100 / 4];
+     uint32_t zerodet_regs[S31_ZERODET_SIZE / 4];
+ 
++    /* PWM blocks: registers only, no outputs */
++    struct S31Regfile {
++        MemoryRegion mr;
++        uint32_t regs[S31_MCPWM_SIZE / 4];
++    } ledc[2], mcpwm[4];
++
+     /* the flash chip, as SPI1 sees it */
+     uint8_t *flash_chip;
+     int flash_fd;
+@@ -1252,6 +1261,42 @@ static const MemoryRegionOps zerodet_ops = {
+     .valid = { .min_access_size = 4, .max_access_size = 4 },
+ };
+ 
++typedef struct S31Regfile S31Regfile;
++
++/*
++ * Blocks modelled as plain registers (what's written reads back): the
++ * LED PWM controllers and motor control PWM.  Enough for drivers to
++ * program them, and to read back what they programmed.
++ */
++static uint64_t regfile_read(void *opaque, hwaddr addr, unsigned size)
++{
++    S31Regfile *r = opaque;
++
++    return r->regs[addr / 4];
++}
++
++static void regfile_write(void *opaque, hwaddr addr, uint64_t val,
++                          unsigned size)
++{
++    S31Regfile *r = opaque;
++
++    r->regs[addr / 4] = val;
++}
++
++static const MemoryRegionOps regfile_ops = {
++    .read = regfile_read,
++    .write = regfile_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void regfile_init(S31Regfile *r, MemoryRegion *sysmem,
++                         const char *name, hwaddr base, uint64_t size)
++{
++    memory_region_init_io(&r->mr, NULL, &regfile_ops, r, name, size);
++    memory_region_add_subregion(sysmem, base, &r->mr);
++}
++
+ /* ------------------------------------------------------- SPI1 (flash) */
+ 
+ /*
+@@ -1705,6 +1750,16 @@ static void esp32s31_machine_init(MachineState *machine)
+     memory_region_init_io(&s->zerodet_mr, NULL, &zerodet_ops, s,
+                           "esp32s31.zero_det", S31_ZERODET_SIZE);
+     memory_region_add_subregion(sysmem, S31_ZERODET_BASE, &s->zerodet_mr);
++    regfile_init(&s->ledc[0], sysmem, "esp32s31.ledc0", S31_LEDC0_BASE,
++                 S31_LEDC_SIZE);
++    regfile_init(&s->ledc[1], sysmem, "esp32s31.ledc1", S31_LEDC1_BASE,
++                 S31_LEDC_SIZE);
++    for (int i = 0; i < 4; i++) {
++        g_autofree char *name = g_strdup_printf("esp32s31.mcpwm%d", i);
++
++        regfile_init(&s->mcpwm[i], sysmem, name,
++                     S31_MCPWM0_BASE + i * 0x1000, S31_MCPWM_SIZE);
++    }
+ 
+     /*
+      * Ethernet: the EMAC is a DesignWare GMAC 3.70a, close enough to the
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From edc21c70558976f2033ddfc97d857dfefdf0fa89 Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 07:46:57 -0400
-Subject: [PATCH 09/13] hw/riscv/esp32s31: add the SD/MMC host
+Subject: [PATCH 09/15] hw/riscv/esp32s31: add the SD/MMC host
 
 The ESP32-S31's SD host is a DesignWare MSHC at 0x20342000, interrupt
 matrix source 3.  Slot 0 gets the card from -drive if=sd.

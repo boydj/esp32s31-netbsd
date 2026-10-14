@@ -361,6 +361,22 @@ if a.hw:
         check("rtc set", "date 203001020304.05 >/dev/null; date +%Y", "2030")
         print(f"rtc: login after {relogin():.1f}s", flush=True)
         check("rtc after reboot", "date +%Y%m%d", "20300102")
+        # CAN: QEMU puts both controllers on one bus.
+        check("can", "ifconfig esptwai0 up && ifconfig esptwai1 up &&"
+              " (candump -n 2 -t 10 esptwai1 & sleep 1;"
+              " cansend esptwai0 123#deadbeef;"
+              " cansend esptwai0 1abcdef0#0102; wait) | tr -s ' ' |"
+              " tr '\\n' '/'", " esptwai1 123 [4] DE AD BE EF/"
+              " esptwai1 1ABCDEF0 [2] 01 02/", 60)
+    # PWM: what the drivers programmed, read back from the registers.
+    check("pwm ledc", "sysctl -w hw.espledc0.ch0.pin=5"
+          " hw.espledc0.ch0.period=1000000 hw.espledc0.ch0.duty=250000"
+          " >/dev/null; echo $(sysctl -n hw.espledc0.ch0.actual"
+          " hw.espgpio0.pin5)",
+          "period 1000000 ns (1000.000 Hz), 16384 steps ledc0_0")
+    check("pwm mcpwm", "sysctl -w hw.espmcpwm1.ch0.period=20000000"
+          " hw.espmcpwm1.ch0.duty=1500000 >/dev/null;"
+          " sysctl -n hw.espmcpwm1.ch0.actual", "(50.000 Hz)")
     # Armed and never tickled, the watchdog resets the system.
     child.sendline("wdogctl -e -p 3 espwdt0 && wdogctl && sleep 30")
     t1 = time.time()

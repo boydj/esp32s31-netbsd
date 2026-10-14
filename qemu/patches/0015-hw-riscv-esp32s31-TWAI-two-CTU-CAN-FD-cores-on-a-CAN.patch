@@ -1,0 +1,137 @@
+From 4810b7d3fa02d3ca09ec324f877510338ed28df9 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 16:22:33 -0400
+Subject: [PATCH 15/15] hw/riscv/esp32s31: TWAI, two CTU CAN FD cores on a CAN
+ bus
+
+QEMU's CTU CAN FD core model for both controllers (without the ESP-only
+timestamp timer), on one CAN bus at /machine/canbus, which
+can-host-socketcan can connect to a host's CAN interface.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/riscv/Kconfig    |  1 +
+ hw/riscv/esp32s31.c | 59 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+index 6168cce..97dfa0c 100644
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -79,6 +79,7 @@ config ESP32S31
+     select USB_DWC2
+     select DW_MSHC
+     select ESP32S31_COPROC
++    select CAN_CTUCANFD
+ 
+ config SHAKTI_C
+     bool
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index 29d8a63..087d98b 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -64,6 +64,8 @@
+ #include "system/reset.h"
+ #include "target/riscv/cpu.h"
+ #include <libfdt.h>
++#include "net/can_emu.h"
++#include "../net/can/ctucan_core.h"
+ 
+ #define TYPE_ESP32S31_MACHINE MACHINE_TYPE_NAME("esp32s31")
+ OBJECT_DECLARE_SIMPLE_TYPE(Esp32s31State, ESP32S31_MACHINE)
+@@ -88,6 +90,7 @@ enum {
+     S31_LEDC0_BASE      = 0x20392000, S31_LEDC1_BASE  = 0x2039c000,
+     S31_LEDC_SIZE       = 0x800,
+     S31_MCPWM0_BASE     = 0x20381000, S31_MCPWM_SIZE  = 0x1000,
++    S31_TWAI0_BASE      = 0x20394000, S31_TWAI_SIZE   = 0x1000,
+     S31_EMAC_BASE       = 0x20350000,
+     S31_USB_BASE        = 0x20300000,
+     S31_USJ_BASE        = 0x20391000, S31_USJ_SIZE    = 0x1000,
+@@ -108,6 +111,8 @@ enum {
+ #define S31_SRC_SDIO_HOST   3
+ #define S31_SRC_UART0       9
+ #define S31_SRC_SYSTIMER0   33
++#define S31_SRC_TWAI0       18
++#define S31_SRC_TWAI1       20
+ #define S31_SRC_EMAC        98
+ #define S31_SRC_USB_OTGHS   99
+ #define S31_SRC_FROM_CPU2   67
+@@ -150,6 +155,11 @@ struct Esp32s31State {
+         uint32_t regs[S31_MCPWM_SIZE / 4];
+     } ledc[2], mcpwm[4];
+ 
++    /* TWAI: two CTU CAN FD cores on one CAN bus ("/machine/canbus") */
++    CtuCanCoreState twai[2];
++    MemoryRegion twai_mr[2];
++    CanBusState *canbus;
++
+     /* the flash chip, as SPI1 sees it */
+     uint8_t *flash_chip;
+     int flash_fd;
+@@ -1297,6 +1307,36 @@ static void regfile_init(S31Regfile *r, MemoryRegion *sysmem,
+     memory_region_add_subregion(sysmem, base, &r->mr);
+ }
+ 
++/*
++ * TWAI: QEMU's CTU CAN FD core, the registers below 0x500; the ESP-only
++ * timestamp timer above 0xfd0 isn't there.  Both controllers sit on the
++ * machine's CAN bus, which can-host-socketcan can join to a host's.
++ */
++static uint64_t twai_read(void *opaque, hwaddr addr, unsigned size)
++{
++    CtuCanCoreState *c = opaque;
++
++    return addr < CTUCAN_CORE_MEM_SIZE ? ctucan_mem_read(c, addr, size) : 0;
++}
++
++static void twai_write(void *opaque, hwaddr addr, uint64_t val,
++                       unsigned size)
++{
++    CtuCanCoreState *c = opaque;
++
++    if (addr < CTUCAN_CORE_MEM_SIZE) {
++        ctucan_mem_write(c, addr, val, size);
++    }
++}
++
++static const MemoryRegionOps twai_ops = {
++    .read = twai_read,
++    .write = twai_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = { .min_access_size = 1, .max_access_size = 4 },
++    .valid = { .min_access_size = 1, .max_access_size = 4 },
++};
++
+ /* ------------------------------------------------------- SPI1 (flash) */
+ 
+ /*
+@@ -1750,6 +1790,25 @@ static void esp32s31_machine_init(MachineState *machine)
+     memory_region_init_io(&s->zerodet_mr, NULL, &zerodet_ops, s,
+                           "esp32s31.zero_det", S31_ZERODET_SIZE);
+     memory_region_add_subregion(sysmem, S31_ZERODET_BASE, &s->zerodet_mr);
++    s->canbus = CAN_BUS(object_new(TYPE_CAN_BUS));
++    object_property_add_child(OBJECT(machine), "canbus", OBJECT(s->canbus));
++    object_unref(OBJECT(s->canbus));
++    for (int i = 0; i < 2; i++) {
++        g_autofree char *name = g_strdup_printf("esp32s31.twai%d", i);
++
++        ctucan_init(&s->twai[i],
++                    qemu_allocate_irq(esp32s31_source_irq, s,
++                                      i ? S31_SRC_TWAI1 : S31_SRC_TWAI0));
++        if (ctucan_connect_to_bus(&s->twai[i], s->canbus) < 0) {
++            error_report("esp32s31: can't put TWAI%d on the CAN bus", i);
++            exit(1);
++        }
++        ctucan_hardware_reset(&s->twai[i]);
++        memory_region_init_io(&s->twai_mr[i], NULL, &twai_ops, &s->twai[i],
++                              name, S31_TWAI_SIZE);
++        memory_region_add_subregion(sysmem, S31_TWAI0_BASE + i * 0x1000,
++                                    &s->twai_mr[i]);
++    }
+     regfile_init(&s->ledc[0], sysmem, "esp32s31.ledc0", S31_LEDC0_BASE,
+                  S31_LEDC_SIZE);
+     regfile_init(&s->ledc[1], sysmem, "esp32s31.ledc1", S31_LEDC1_BASE,
+-- 
+2.43.0
+

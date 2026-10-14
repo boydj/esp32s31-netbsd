@@ -1,7 +1,7 @@
 From e034daabbe61d5fbc90b450848e9a918222bf0fc Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 01:30:54 -0400
-Subject: [PATCH 07/13] hw/net/npcm_gmac: support enhanced descriptors; use
+Subject: [PATCH 07/15] hw/net/npcm_gmac: support enhanced descriptors; use
  them for the S31
 
 The ESP32-S31's GMAC is built with enhanced (alternate) descriptors,

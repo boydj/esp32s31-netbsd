@@ -1,7 +1,7 @@
 From 56c47c63505e3555077be6a0a67116b3f77e8992 Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 13:58:30 -0400
-Subject: [PATCH 11/13] hw/riscv/esp32s31: SPI1 flash commands, optional
+Subject: [PATCH 11/15] hw/riscv/esp32s31: SPI1 flash commands, optional
  write-back
 
 Model the MSPI controller's software port to the flash: user commands
