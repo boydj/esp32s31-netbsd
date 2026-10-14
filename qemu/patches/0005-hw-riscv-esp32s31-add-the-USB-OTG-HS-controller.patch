@@ -1,7 +1,7 @@
 From 12eb39d0a774423736494940a195ae84e1c14dec Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 00:13:56 -0400
-Subject: [PATCH 05/10] hw/riscv/esp32s31: add the USB OTG-HS controller
+Subject: [PATCH 05/12] hw/riscv/esp32s31: add the USB OTG-HS controller
 
 Model the ESP32-S31's DesignWare HS OTG controller with QEMU's dwc2 host
 model at 0x20300000, wired to interrupt matrix source 99, with DMA to

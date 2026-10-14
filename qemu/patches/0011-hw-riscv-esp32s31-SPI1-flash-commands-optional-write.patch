@@ -1,0 +1,320 @@
+From 56c47c63505e3555077be6a0a67116b3f77e8992 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 13:58:30 -0400
+Subject: [PATCH 11/12] hw/riscv/esp32s31: SPI1 flash commands, optional
+ write-back
+
+Model the MSPI controller's software port to the flash: user commands
+(reads, RDID, RDSR, WREN/WRDI, erase, program) and the built-in write
+enable, sector/block erase and page program.  Changes go to a whole-chip
+image, the XIP window's copy and, with flash-writeback=on, the image
+file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/riscv/esp32s31.c | 227 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 226 insertions(+), 1 deletion(-)
+
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index b415481..36f6d4a 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -79,6 +79,7 @@ enum {
+     S31_UART0_BASE      = 0x2038a000, S31_UART_SIZE   = 0x1000,
+     S31_SYSTIMER_BASE   = 0x20399000, S31_SYSTIMER_SIZE = 0x100,
+     S31_TRNG_BASE       = 0x20814000, S31_TRNG_SIZE   = 0x100,
++    S31_SPI1_BASE       = 0x20501000, S31_SPI1_SIZE   = 0x1000,
+     S31_EMAC_BASE       = 0x20350000,
+     S31_USB_BASE        = 0x20300000,
+     S31_USJ_BASE        = 0x20391000, S31_USJ_SIZE    = 0x1000,
+@@ -90,6 +91,7 @@ enum {
+     S31_LPAON_BASE      = 0x20701000, S31_LPAON_SIZE  = 0x1000,
+     S31_MTIMER_BASE     = 0x3f000000, /* not on the chip; backs the time CSR */
+     S31_FLASH_BASE      = 0x40000000, S31_FLASH_SIZE  = 64 * MiB,
++    S31_FLASH_CHIP_SIZE = 16 * MiB,     /* the chip behind the window */
+     S31_PSRAM_BASE      = 0x50000000, S31_PSRAM_SIZE  = 16 * MiB,
+ };
+ 
+@@ -111,12 +113,19 @@ struct Esp32s31State {
+     RISCVHartArrayState cpus;
+     MemoryRegion lpram, hpram, mrom, resetvec, psram, flash;
+     MemoryRegion clic_m_mr, clic_s_mr, intmtx_mr, systimer_mr, uart_mr;
+-    MemoryRegion lpaon_mr, trng_mr, usj_mr, gpio_mr;
++    MemoryRegion lpaon_mr, trng_mr, usj_mr, gpio_mr, spi1_mr;
+ 
+     /* properties */
+     char *flash_file;
+     uint32_t xip_offset;
+     bool asid;
++    bool flash_writeback;
++
++    /* the flash chip, as SPI1 sees it */
++    uint8_t *flash_chip;
++    int flash_fd;
++    uint32_t spi1_regs[S31_SPI1_SIZE / 4];
++    bool flash_wel;
+ 
+     /* CLIC */
+     uint32_t cliccfg;
+@@ -938,6 +947,195 @@ static const MemoryRegionOps trng_ops = {
+     .valid = { .min_access_size = 4, .max_access_size = 4 },
+ };
+ 
++/* ------------------------------------------------------- SPI1 (flash) */
++
++/*
++ * The MSPI controller's software port to the flash: user-defined
++ * commands (reads, status, ID) and the built-in write enable, sector or
++ * block erase and page program.  Commands complete at once.  Writes go to
++ * the whole-chip image, to the XIP window's copy of it, and with
++ * flash-writeback=on to the image file.
++ */
++#define SPI1_CMD                0x00
++#define  SPI1_CMD_USR           (1u << 18)
++#define  SPI1_CMD_FLASH_BE      (1u << 23)
++#define  SPI1_CMD_FLASH_SE      (1u << 24)
++#define  SPI1_CMD_FLASH_PP      (1u << 25)
++#define  SPI1_CMD_FLASH_RDSR    (1u << 27)
++#define  SPI1_CMD_FLASH_WRDI    (1u << 29)
++#define  SPI1_CMD_FLASH_WREN    (1u << 30)
++#define SPI1_ADDR               0x04
++#define SPI1_USER               0x18
++#define  SPI1_USER_USR_MOSI     (1u << 27)
++#define  SPI1_USER_USR_MISO     (1u << 28)
++#define SPI1_USER2              0x20
++#define SPI1_MOSI_DLEN          0x24
++#define SPI1_MISO_DLEN          0x28
++#define SPI1_RD_STATUS          0x2c
++#define SPI1_W0                 0x58
++#define SPI1_NW                 16
++#define SPI1_DATE               0x3fc
++
++#define S31_FLASH_ID            0x1840c8    /* GigaDevice GD25Q128 */
++
++static void spi1_flash_changed(Esp32s31State *s, uint32_t off, uint32_t len)
++{
++    uint8_t *xip = memory_region_get_ram_ptr(&s->flash);
++
++    if (off + len > s->xip_offset) {
++        uint32_t from = MAX(off, s->xip_offset);
++        uint32_t to = MIN(off + len,
++                          s->xip_offset + (uint32_t)S31_FLASH_SIZE);
++
++        if (to > from) {
++            memcpy(xip + (from - s->xip_offset), s->flash_chip + from,
++                   to - from);
++        }
++    }
++    if (s->flash_fd >= 0 &&
++        pwrite(s->flash_fd, s->flash_chip + off, len, off) != len) {
++        warn_report("esp32s31: can't write back flash at 0x%x", off);
++    }
++}
++
++static void spi1_erase(Esp32s31State *s, uint32_t addr, uint32_t size)
++{
++    if (!s->flash_wel) {
++        return;
++    }
++    addr &= (S31_FLASH_CHIP_SIZE - 1) & ~(size - 1);
++    memset(s->flash_chip + addr, 0xff, size);
++    spi1_flash_changed(s, addr, size);
++    s->flash_wel = false;
++}
++
++static void spi1_program(Esp32s31State *s, uint32_t addr, uint32_t len)
++{
++    const uint8_t *buf = (const uint8_t *)&s->spi1_regs[SPI1_W0 / 4];
++    uint32_t page = addr & (S31_FLASH_CHIP_SIZE - 1) & ~0xffu;
++
++    if (!s->flash_wel) {
++        return;
++    }
++    len = MIN(len, SPI1_NW * 4u);
++    for (uint32_t i = 0; i < len; i++) {
++        /* NOR: bits only go from 1 to 0; wraps within the page */
++        s->flash_chip[page + ((addr + i) & 0xff)] &= buf[i];
++    }
++    spi1_flash_changed(s, page, 256);
++    s->flash_wel = false;
++}
++
++static uint8_t spi1_status(Esp32s31State *s)
++{
++    return s->flash_wel ? 0x02 : 0x00;
++}
++
++static void spi1_user(Esp32s31State *s)
++{
++    uint32_t *r = s->spi1_regs;
++    uint8_t *w = (uint8_t *)&r[SPI1_W0 / 4];
++    uint32_t user = r[SPI1_USER / 4];
++    uint8_t cmd = r[SPI1_USER2 / 4] & 0xff;
++    uint32_t addr = r[SPI1_ADDR / 4] & (S31_FLASH_CHIP_SIZE - 1);
++    uint32_t inlen = (user & SPI1_USER_USR_MISO) ?
++                     MIN((r[SPI1_MISO_DLEN / 4] & 0x3ff) / 8 + 1,
++                         SPI1_NW * 4u) : 0;
++    uint32_t outlen = (user & SPI1_USER_USR_MOSI) ?
++                      MIN((r[SPI1_MOSI_DLEN / 4] & 0x3ff) / 8 + 1,
++                          SPI1_NW * 4u) : 0;
++    uint32_t id = cpu_to_le32(S31_FLASH_ID);
++
++    switch (cmd) {
++    case 0x03: case 0x0b: case 0x3b: case 0x6b: case 0xbb: case 0xeb:
++        for (uint32_t i = 0; i < inlen; i++) {
++            w[i] = s->flash_chip[(addr + i) & (S31_FLASH_CHIP_SIZE - 1)];
++        }
++        break;
++    case 0x9f:
++        memcpy(w, &id, MIN(inlen, 3u));
++        break;
++    case 0x05:
++        w[0] = spi1_status(s);
++        break;
++    case 0x35:
++    case 0x15:
++        w[0] = 0;
++        break;
++    case 0x06:
++        s->flash_wel = true;
++        break;
++    case 0x04:
++        s->flash_wel = false;
++        break;
++    case 0x20:
++        spi1_erase(s, addr, 4 * KiB);
++        break;
++    case 0xd8:
++        spi1_erase(s, addr, 64 * KiB);
++        break;
++    case 0x02:
++        spi1_program(s, addr, outlen);
++        break;
++    default:
++        qemu_log_mask(LOG_UNIMP, "esp32s31: SPI1 command 0x%02x\n", cmd);
++        break;
++    }
++}
++
++static uint64_t spi1_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    if (addr == SPI1_CMD) {
++        return 0;               /* always done */
++    }
++    return s->spi1_regs[addr / 4];
++}
++
++static void spi1_write(void *opaque, hwaddr addr, uint64_t val,
++                       unsigned size)
++{
++    Esp32s31State *s = opaque;
++    uint32_t a;
++
++    if (addr != SPI1_CMD) {
++        if (addr != SPI1_DATE) {
++            s->spi1_regs[addr / 4] = val;
++        }
++        return;
++    }
++    a = s->spi1_regs[SPI1_ADDR / 4];
++    if (val & SPI1_CMD_FLASH_WREN) {
++        s->flash_wel = true;
++    }
++    if (val & SPI1_CMD_FLASH_WRDI) {
++        s->flash_wel = false;
++    }
++    if (val & SPI1_CMD_FLASH_SE) {
++        spi1_erase(s, a, 4 * KiB);
++    }
++    if (val & SPI1_CMD_FLASH_BE) {
++        spi1_erase(s, a, 64 * KiB);
++    }
++    if (val & SPI1_CMD_FLASH_PP) {
++        spi1_program(s, a & 0xffffff, a >> 24);
++    }
++    if (val & SPI1_CMD_FLASH_RDSR) {
++        s->spi1_regs[SPI1_RD_STATUS / 4] = spi1_status(s);
++    }
++    if (val & SPI1_CMD_USR) {
++        spi1_user(s);
++    }
++}
++
++static const MemoryRegionOps spi1_ops = {
++    .read = spi1_read,
++    .write = spi1_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
+ /* ------------------------------------------------------------- the board */
+ 
+ static void esp32s31_reset(void *opaque)
+@@ -1113,6 +1311,9 @@ static void esp32s31_machine_init(MachineState *machine)
+                            &error_fatal);
+     uint8_t *flash = memory_region_get_ram_ptr(&s->flash);
+     memset(flash, 0xff, S31_FLASH_SIZE);
++    s->flash_chip = g_malloc(S31_FLASH_CHIP_SIZE);
++    memset(s->flash_chip, 0xff, S31_FLASH_CHIP_SIZE);
++    s->flash_fd = -1;
+     memory_region_add_subregion(sysmem, S31_FLASH_BASE, &s->flash);
+ 
+     /* Peripherals */
+@@ -1145,6 +1346,9 @@ static void esp32s31_machine_init(MachineState *machine)
+     memory_region_init_io(&s->trng_mr, NULL, &trng_ops, s,
+                           "esp32s31.trng", S31_TRNG_SIZE);
+     memory_region_add_subregion(sysmem, S31_TRNG_BASE, &s->trng_mr);
++    memory_region_init_io(&s->spi1_mr, NULL, &spi1_ops, s,
++                          "esp32s31.spi1", S31_SPI1_SIZE);
++    memory_region_add_subregion(sysmem, S31_SPI1_BASE, &s->spi1_mr);
+ 
+     /*
+      * Ethernet: the EMAC is a DesignWare GMAC 3.70a, close enough to the
+@@ -1262,6 +1466,11 @@ static void esp32s31_machine_init(MachineState *machine)
+                            (size_t)S31_FLASH_SIZE);
+             memcpy(flash, img + s->xip_offset, n);
+         }
++        memcpy(s->flash_chip, img, MIN((size_t)size,
++                                       (size_t)S31_FLASH_CHIP_SIZE));
++        if (s->flash_writeback) {
++            s->flash_fd = qemu_open(s->flash_file, O_RDWR, &error_fatal);
++        }
+         if (!machine->firmware) {
+             esp32s31_spl_boot(s, flash, S31_FLASH_SIZE);
+             return;
+@@ -1327,6 +1536,16 @@ static void esp32s31_set_asid(Object *obj, bool val, Error **errp)
+     ESP32S31_MACHINE(obj)->asid = val;
+ }
+ 
++static bool esp32s31_get_flash_writeback(Object *obj, Error **errp)
++{
++    return ESP32S31_MACHINE(obj)->flash_writeback;
++}
++
++static void esp32s31_set_flash_writeback(Object *obj, bool val, Error **errp)
++{
++    ESP32S31_MACHINE(obj)->flash_writeback = val;
++}
++
+ static void esp32s31_machine_instance_init(Object *obj)
+ {
+     Esp32s31State *s = ESP32S31_MACHINE(obj);
+@@ -1358,6 +1577,12 @@ static void esp32s31_machine_class_init(ObjectClass *oc, const void *data)
+                               esp32s31_set_xip_offset, NULL, NULL);
+     object_class_property_set_description(oc, "xip-offset",
+         "Raw flash offset the SPL maps at 0x40000000 (default 0x100000)");
++    object_class_property_add_bool(oc, "flash-writeback",
++                                   esp32s31_get_flash_writeback,
++                                   esp32s31_set_flash_writeback);
++    object_class_property_set_description(oc, "flash-writeback",
++        "Write flash erases and programs (SPI1) back to the image file "
++        "(default off)");
+     object_class_property_add_bool(oc, "asid", esp32s31_get_asid,
+                                    esp32s31_set_asid);
+     object_class_property_set_description(oc, "asid",
+-- 
+2.43.0
+

@@ -12,6 +12,7 @@ import argparse
 import atexit
 import os
 import socket
+import threading
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,12 @@ ap.add_argument("--sd", action="store_true",
                 help="QEMU only: format, write and read back a blank SD card")
 ap.add_argument("--gpio", action="store_true",
                 help="drive a GPIO pin with gpioctl and read it back")
+ap.add_argument("--uart", action="store_true",
+                help="UART1 through a TCP echo peer (QEMU only)")
+ap.add_argument("--hw", action="store_true",
+                help="sensors, RTC time across a reboot, watchdog reset")
+ap.add_argument("--persist", action="store_true",
+                help="write to /persist and /etc (flash), check after a reboot")
 ap.add_argument("--wifi", action="store_true",
                 help="join the access point (esp-emulator's, or QEMU's "
                      "stand-in) with espwifictl, then DHCP, ping and an HTTP "
@@ -113,6 +120,16 @@ else:
             usj_port = probe.getsockname()[1]
         argv += ["-serial",
                  f"tcp:127.0.0.1:{usj_port},server=on,wait=off"]
+    if a.uart:
+        # UART1 is QEMU's third serial port; the harness echoes it back in
+        # upper case.
+        if not a.usj:
+            argv += ["-serial", "null"]
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            uart_port = probe.getsockname()[1]
+        argv += ["-serial",
+                 f"tcp:127.0.0.1:{uart_port},server=on,wait=off"]
     if a.sd:
         # A blank 32 MiB card (QEMU wants a power-of-two size).
         sdimg = tempfile.NamedTemporaryFile(prefix="s31sd.", suffix=".img",
@@ -235,6 +252,19 @@ def usj_session():
 if a.usj:
     print(f"usb-serial/jtag login: {'ok' if usj_session() else 'FAILED'}",
           flush=True)
+if a.uart:
+    def uart_echo():
+        sock = socket.create_connection(("127.0.0.1", uart_port))
+        while True:
+            d = sock.recv(256)
+            if not d:
+                break
+            sock.sendall(d.upper())
+    threading.Thread(target=uart_echo, daemon=True).start()
+    check("uart1", "exec 3<>/dev/ttyEU1; stty raw -echo 9600 <&3 &&"
+          " stty -a <&3 | head -1; (sleep 1; echo hello-uart1 >&3) &"
+          " dd bs=1 count=11 <&3 2>/dev/null; echo; exec 3<&-",
+          "HELLO-UART1")
 if a.sd:
     check("sd card", "newfs_msdos -F 16 /dev/rld0c >/dev/null &&"
           " mount -t msdos /dev/ld0c /mnt &&"
@@ -276,6 +306,54 @@ if a.vi:
     out = child.before.decode(errors="replace")
     ok = "hello from vi on the ESP32-S31" in out.split("\n", 1)[-1]
     print(f"vi test: {'ok' if ok else 'FAILED'}", flush=True)
+def relogin():
+    child.sendline("reboot")
+    t1 = time.time()
+    child.expect("login:")
+    child.sendline("root")
+    child.expect("esp32s31# ")
+    return time.time() - t1
+if a.persist:
+    # /persist is the flash's writable partition, made on first boot;
+    # /etc is union-mounted on /persist/etc.
+    check("persist mounted", "mount | grep -cE ' on /persist type ffs|"
+          " on /etc type union'", "2")
+    check("persist write", "echo persist-$((6*7)) > /etc/ptest &&"
+          " dd if=/dev/urandom of=/persist/blob bs=4k count=96 2>/dev/null &&"
+          " sha256 -q /persist/blob > /persist/blob.sha &&"
+          " echo written-$((6*7))", "written-42", 600)
+    print(f"persist: login after {relogin():.1f}s", flush=True)
+    check("persist after reboot", "[ \"$(cat /etc/ptest)\" = persist-42 ] &&"
+          " sha256 -q /persist/blob | cmp -s - /persist/blob.sha &&"
+          " echo persisted-$((6*7))", "persisted-42", 300)
+    check("persist rewrite", "dd if=/dev/urandom of=/persist/blob bs=4k"
+          " count=96 conv=notrunc 2>/dev/null && sha256 -q /persist/blob >"
+          " /persist/blob.sha && rm /etc/ptest && sync &&"
+          " fsck_ffs -n /dev/respnor0a 2>&1 | tail -1", "files,", 600)
+if a.hw:
+    # Temperature from the co-processor (the stand-in says 25 C); in
+    # QEMU, two ADC channels as well.
+    check("sensors", "sysctl -w hw.espsensor0.adc_channels=0x101 >/dev/null;"
+          " envstat -s espsensor0:temperature",
+          "degC", 60)
+    if not a.esp_emu:
+        check("adc", "envstat | grep 'ADC2_0'", "1.800", 60)
+        # The RTC timer keeps the time of day across a reboot.
+        check("rtc set", "date 203001020304.05 >/dev/null; date +%Y", "2030")
+        print(f"rtc: login after {relogin():.1f}s", flush=True)
+        check("rtc after reboot", "date +%Y%m%d", "20300102")
+    # Armed and never tickled, the watchdog resets the system.
+    child.sendline("wdogctl -e -p 3 espwdt0 && wdogctl && sleep 30")
+    t1 = time.time()
+    try:
+        child.expect("login:", timeout=120)
+        print(f"watchdog: reset after {time.time() - t1:.1f}s", flush=True)
+        child.sendline("root")
+        child.expect("esp32s31# ")
+    except pexpect.TIMEOUT:
+        print("watchdog: FAILED (no reset)", flush=True)
+        child.sendcontrol("c")
+        child.expect("esp32s31# ")
 for n in range(a.reboots):
     child.sendline("reboot")
     t1 = time.time()

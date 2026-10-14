@@ -62,6 +62,7 @@ for d in \
     lib/libprop \
     lib/libbluetooth \
     external/bsd/libevent/lib/libevent \
+    crypto/external/bsd/netpgp/libmj \
     lib/libbz2 \
     lib/libz
 do

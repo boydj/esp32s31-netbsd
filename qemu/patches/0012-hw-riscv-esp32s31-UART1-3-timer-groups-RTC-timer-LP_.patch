@@ -1,0 +1,640 @@
+From 9010b7e57ee1d703a28a098a2fd63636c7df2949 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 15:15:07 -0400
+Subject: [PATCH 12/12] hw/riscv/esp32s31: UART1-3, timer groups, RTC timer,
+ LP_SYS, IO_MUX
+
+UART1-3 (serial ports 3-5) with the S31 register layout and loopback;
+the timer groups' watchdog (system reset) and RTC slow clock
+calibration; the RTC timer counting a 136 kHz slow clock; LP_SYS
+registers that survive resets; IO_MUX registers.  The co-processor
+stand-in answers sensor requests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/misc/esp32s31_coproc.c |  32 ++-
+ hw/riscv/esp32s31.c       | 396 ++++++++++++++++++++++++++++++++------
+ 2 files changed, 370 insertions(+), 58 deletions(-)
+
+diff --git a/hw/misc/esp32s31_coproc.c b/hw/misc/esp32s31_coproc.c
+index 3f36a44..afd31c6 100644
+--- a/hw/misc/esp32s31_coproc.c
++++ b/hw/misc/esp32s31_coproc.c
+@@ -77,6 +77,9 @@
+ #define CTL_WIFI_STATUS 7
+ #define CTL_BT_ENABLE   8
+ #define CTL_BT_DISABLE  9
++#define CTL_SENSORS     10
++#define CAP_SENSORS     4
++#define ADC_CHANNELS    16
+ #define EVT_WIFI_LINK   64
+ 
+ #define WIFI_OFF        0
+@@ -115,6 +118,11 @@ static void mem_write(hwaddr addr, const void *buf, hwaddr len)
+                         buf, len);
+ }
+ 
++static void st32(uint8_t *p, uint32_t v)
++{
++    stl_le_p(p, v);
++}
++
+ static uint32_t mem_ld32(hwaddr addr)
+ {
+     uint8_t b[4];
+@@ -479,6 +487,28 @@ static void ctl_input(Esp32s31CoprocState *s, uint8_t type,
+         s->bt_enabled = false;
+         ctl_reply(s, type, seq, 0, NULL, 0);
+         break;
++    case CTL_SENSORS: {
++        /*
++         * struct espcp_sensors: 25 C; the ADC channels asked for read
++         * 100 mV apart, from 1000 mV, calibrated.
++         */
++        uint8_t r[16 + 8 * ADC_CHANNELS];
++        uint32_t mask = len >= 4 ? ld32(data) & 0xffff : 0;
++
++        memset(r, 0, sizeof(r));
++        st32(r, 25000);
++        st32(r + 4, 1);
++        st32(r + 8, mask);
++        st32(r + 12, mask);
++        for (int i = 0; i < ADC_CHANNELS; i++) {
++            if (mask & (1u << i)) {
++                st32(r + 16 + 4 * i, 1000 + 100 * i);
++                st32(r + 16 + 4 * ADC_CHANNELS + 4 * i, 1000 + 100 * i);
++            }
++        }
++        ctl_reply(s, type, seq, 0, r, sizeof(r));
++        break;
++    }
+     default:
+         ctl_reply(s, type, seq, E_OPNOTSUPP, NULL, 0);
+         break;
+@@ -602,7 +632,7 @@ static void coproc_boot(void *opaque)
+     mac[11]++;
+     mem_write(s->shm + SHM_WIFI_MAC, mac, 12);
+     mem_st32(s->shm + SHM_CAPS, (s->nic ? 1 : 0) |
+-             (qemu_chr_fe_backend_connected(&s->chr) ? 2 : 0));
++             (qemu_chr_fe_backend_connected(&s->chr) ? 2 : 0) | CAP_SENSORS);
+     mem_st32(s->shm, SHM_MAGIC);
+ 
+     s->running = true;
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index 36f6d4a..7a41a5b 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -80,6 +80,10 @@ enum {
+     S31_SYSTIMER_BASE   = 0x20399000, S31_SYSTIMER_SIZE = 0x100,
+     S31_TRNG_BASE       = 0x20814000, S31_TRNG_SIZE   = 0x100,
+     S31_SPI1_BASE       = 0x20501000, S31_SPI1_SIZE   = 0x1000,
++    S31_TIMG0_BASE      = 0x20580000, S31_TIMG_SIZE   = 0x1000,
++    S31_IOMUX_BASE      = 0x20582000, S31_IOMUX_SIZE  = 0x100,
++    S31_LPSYS_BASE      = 0x20700000, S31_LPSYS_SIZE  = 0x1000,
++    S31_RTCTIMER_BASE   = 0x20800000, S31_RTCTIMER_SIZE = 0x1000,
+     S31_EMAC_BASE       = 0x20350000,
+     S31_USB_BASE        = 0x20300000,
+     S31_USJ_BASE        = 0x20391000, S31_USJ_SIZE    = 0x1000,
+@@ -112,8 +116,9 @@ struct Esp32s31State {
+ 
+     RISCVHartArrayState cpus;
+     MemoryRegion lpram, hpram, mrom, resetvec, psram, flash;
+-    MemoryRegion clic_m_mr, clic_s_mr, intmtx_mr, systimer_mr, uart_mr;
++    MemoryRegion clic_m_mr, clic_s_mr, intmtx_mr, systimer_mr;
+     MemoryRegion lpaon_mr, trng_mr, usj_mr, gpio_mr, spi1_mr;
++    MemoryRegion iomux_mr, lpsys_mr, rtctimer_mr;
+ 
+     /* properties */
+     char *flash_file;
+@@ -121,6 +126,19 @@ struct Esp32s31State {
+     bool asid;
+     bool flash_writeback;
+ 
++    /* timer groups: the watchdogs, and RTC slow clock calibration */
++    struct S31Timg {
++        struct Esp32s31State *s;
++        MemoryRegion mr;
++        QEMUTimer *wdt;
++        uint32_t regs[0x100 / 4];
++    } timg[2];
++
++    /* IO_MUX and LP_SYS (the LP store registers survive resets) */
++    uint32_t iomux_regs[S31_IOMUX_SIZE / 4];
++    uint32_t lpsys_regs[S31_LPSYS_SIZE / 4];
++    uint32_t rtc_regs[0x100 / 4];
++
+     /* the flash chip, as SPI1 sees it */
+     uint8_t *flash_chip;
+     int flash_fd;
+@@ -152,12 +170,17 @@ struct Esp32s31State {
+     bool st_loaded;
+     QEMUTimer *st_timer;
+ 
+-    /* UART0 */
+-    CharFrontend chr;
+-    uint8_t rx_fifo[128];
+-    uint32_t rx_head, rx_count;
+-    uint32_t uart_int_raw, uart_int_ena;
+-    uint32_t uart_regs[0x100 / 4];
++    /* UART0-3 */
++    struct S31Uart {
++        struct Esp32s31State *s;
++        int src;
++        MemoryRegion mr;
++        CharFrontend chr;
++        uint8_t rx_fifo[128];
++        uint32_t rx_head, rx_count;
++        uint32_t int_raw, int_ena;
++        uint32_t regs[0x100 / 4];
++    } uart[4];
+ 
+     /* USB-Serial/JTAG: endpoint 1, the CDC-ACM serial port */
+     CharFrontend usj_chr;
+@@ -549,6 +572,11 @@ static const MemoryRegionOps systimer_ops = {
+ 
+ /* ------------------------------------------------------------------ UART */
+ 
++/*
++ * UART0 is the console (the first serial port); UART1-3 are serial ports
++ * 3-5 (the second is the USB-Serial/JTAG port).  Transmission is
++ * instantaneous; CONF0.LOOPBACK sends what's written back to the receiver.
++ */
+ #define UART_FIFO           0x00
+ #define UART_INT_RAW        0x04
+ #define UART_INT_ST         0x08
+@@ -558,20 +586,24 @@ static const MemoryRegionOps systimer_ops = {
+ #define  UART_INT_TXFIFO_EMPTY  (1u << 1)
+ #define UART_STATUS         0x1c
+ #define UART_CONF0          0x20
++#define  UART_CONF0_LOOPBACK    (1u << 12)
++#define  UART_CONF0_RXFIFO_RST  (1u << 22)
+ #define UART_CONF1          0x24
+ #define UART_REG_UPDATE     0x98
+ 
+-static uint32_t uart_raw(Esp32s31State *s)
++typedef struct S31Uart S31Uart;
++
++static uint32_t uart_raw(S31Uart *u)
+ {
+-    uint32_t conf1 = s->uart_regs[UART_CONF1 / 4];
+-    uint32_t rx_thr = conf1 & 0x3ff;
+-    uint32_t tx_thr = (conf1 >> 10) & 0x3ff;
+-    uint32_t raw = s->uart_int_raw;
++    uint32_t conf1 = u->regs[UART_CONF1 / 4];
++    uint32_t rx_thr = conf1 & 0xff;
++    uint32_t tx_thr = (conf1 >> 8) & 0xff;
++    uint32_t raw = u->int_raw;
+ 
+     if (rx_thr == 0) {
+         rx_thr = 1;
+     }
+-    if (s->rx_count >= rx_thr) {
++    if (u->rx_count >= rx_thr) {
+         raw |= UART_INT_RXFIFO_FULL;
+     }
+     /* transmission is instantaneous: the TX FIFO is always empty */
+@@ -581,45 +613,52 @@ static uint32_t uart_raw(Esp32s31State *s)
+     return raw;
+ }
+ 
+-static void uart_update_irq(Esp32s31State *s)
++static void uart_update_irq(S31Uart *u)
+ {
+-    esp32s31_set_source(s, S31_SRC_UART0,
+-                        (uart_raw(s) & s->uart_int_ena) != 0);
++    esp32s31_set_source(u->s, u->src, (uart_raw(u) & u->int_ena) != 0);
++}
++
++static void uart_rx_byte(S31Uart *u, uint8_t c)
++{
++    if (u->rx_count < sizeof(u->rx_fifo)) {
++        u->rx_fifo[(u->rx_head + u->rx_count) % sizeof(u->rx_fifo)] = c;
++        u->rx_count++;
++    }
+ }
+ 
+ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned size)
+ {
+-    Esp32s31State *s = opaque;
++    S31Uart *u = opaque;
+     uint32_t val = 0;
+ 
+     switch (addr) {
+     case UART_FIFO:
+-        if (s->rx_count) {
+-            val = s->rx_fifo[s->rx_head];
+-            s->rx_head = (s->rx_head + 1) % sizeof(s->rx_fifo);
+-            s->rx_count--;
+-            qemu_chr_fe_accept_input(&s->chr);
+-            uart_update_irq(s);
++        if (u->rx_count) {
++            val = u->rx_fifo[u->rx_head];
++            u->rx_head = (u->rx_head + 1) % sizeof(u->rx_fifo);
++            u->rx_count--;
++            qemu_chr_fe_accept_input(&u->chr);
++            uart_update_irq(u);
+         }
+         break;
+     case UART_INT_RAW:
+-        val = uart_raw(s);
++        val = uart_raw(u);
+         break;
+     case UART_INT_ST:
+-        val = uart_raw(s) & s->uart_int_ena;
++        val = uart_raw(u) & u->int_ena;
+         break;
+     case UART_INT_ENA:
+-        val = s->uart_int_ena;
++        val = u->int_ena;
+         break;
+     case UART_STATUS:
+-        val = s->rx_count;      /* TXFIFO_CNT is always 0 */
++        val = u->rx_count;      /* RXFIFO_CNT [7:0]; TXFIFO_CNT is 0 */
+         break;
+     case UART_REG_UPDATE:
+         val = 0;                /* updates complete immediately */
+         break;
+     default:
+-        if (addr < sizeof(s->uart_regs)) {
+-            val = s->uart_regs[addr / 4];
++        if (addr < sizeof(u->regs)) {
++            val = u->regs[addr / 4];
+         }
+         break;
+     }
+@@ -629,34 +668,37 @@ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned size)
+ static void uart_write(void *opaque, hwaddr addr, uint64_t val,
+                        unsigned size)
+ {
+-    Esp32s31State *s = opaque;
++    S31Uart *u = opaque;
+     uint8_t ch;
+ 
+     switch (addr) {
+     case UART_FIFO:
+         ch = val;
+-        qemu_chr_fe_write_all(&s->chr, &ch, 1);
++        if (u->regs[UART_CONF0 / 4] & UART_CONF0_LOOPBACK) {
++            uart_rx_byte(u, ch);
++        } else {
++            qemu_chr_fe_write_all(&u->chr, &ch, 1);
++        }
+         break;
+     case UART_INT_ENA:
+-        s->uart_int_ena = val;
++        u->int_ena = val;
+         break;
+     case UART_INT_CLR:
+-        s->uart_int_raw &= ~val;
++        u->int_raw &= ~val;
+         break;
+     case UART_CONF0:
+-        /* RXFIFO_RST / TXFIFO_RST */
+-        if (val & (1u << 17)) {
+-            s->rx_count = 0;
++        if (val & UART_CONF0_RXFIFO_RST) {
++            u->rx_count = 0;
+         }
+-        s->uart_regs[addr / 4] = val;
++        u->regs[addr / 4] = val;
+         break;
+     default:
+-        if (addr < sizeof(s->uart_regs)) {
+-            s->uart_regs[addr / 4] = val;
++        if (addr < sizeof(u->regs)) {
++            u->regs[addr / 4] = val;
+         }
+         break;
+     }
+-    uart_update_irq(s);
++    uart_update_irq(u);
+ }
+ 
+ static const MemoryRegionOps uart_ops = {
+@@ -668,20 +710,19 @@ static const MemoryRegionOps uart_ops = {
+ 
+ static int uart_can_receive(void *opaque)
+ {
+-    Esp32s31State *s = opaque;
++    S31Uart *u = opaque;
+ 
+-    return sizeof(s->rx_fifo) - s->rx_count;
++    return sizeof(u->rx_fifo) - u->rx_count;
+ }
+ 
+ static void uart_receive(void *opaque, const uint8_t *buf, int size)
+ {
+-    Esp32s31State *s = opaque;
++    S31Uart *u = opaque;
+ 
+-    for (int i = 0; i < size && s->rx_count < sizeof(s->rx_fifo); i++) {
+-        s->rx_fifo[(s->rx_head + s->rx_count) % sizeof(s->rx_fifo)] = buf[i];
+-        s->rx_count++;
++    for (int i = 0; i < size; i++) {
++        uart_rx_byte(u, buf[i]);
+     }
+-    uart_update_irq(s);
++    uart_update_irq(u);
+ }
+ 
+ /* ------------------------------------------------------ USB-Serial/JTAG */
+@@ -947,6 +988,195 @@ static const MemoryRegionOps trng_ops = {
+     .valid = { .min_access_size = 4, .max_access_size = 4 },
+ };
+ 
++/* ------------------------------------------------------- timer groups */
++
++/*
++ * Only what NetBSD uses: the main system watchdog (one stage, "reset
++ * system"), and in group 0 the RTC slow clock calibration, which finds
++ * the 136 kHz RC oscillator exactly where it should be.
++ */
++#define TIMG_WDTCONFIG0     0x48
++#define  WDT_EN                 (1u << 31)
++#define  WDT_CONF_UPDATE        (1u << 22)
++#define TIMG_WDTCONFIG1     0x4c
++#define TIMG_WDTCONFIG2     0x50
++#define TIMG_WDTFEED        0x60
++#define TIMG_WDTWPROTECT    0x64
++#define  WDT_WKEY               0x50d83aa1
++#define TIMG_RTCCALICFG     0x68
++#define  CALI_RDY               (1u << 15)
++#define  CALI_START             (1u << 31)
++#define TIMG_RTCCALICFG1    0x6c
++#define TIMG_RTCCALICFG2    0x80
++
++#define S31_RC_SLOW_HZ      136000
++
++typedef struct S31Timg S31Timg;
++
++static void timg_wdt_arm(S31Timg *t)
++{
++    uint32_t c0 = t->regs[TIMG_WDTCONFIG0 / 4];
++    uint64_t prescale = t->regs[TIMG_WDTCONFIG1 / 4] >> 16;
++    uint64_t ticks = t->regs[TIMG_WDTCONFIG2 / 4];
++
++    if (!(c0 & WDT_EN) || ((c0 >> 29) & 3) != 3) {
++        timer_del(t->wdt);
++        return;
++    }
++    if (prescale == 0) {
++        prescale = 1;
++    }
++    timer_mod(t->wdt, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++              muldiv64(ticks * prescale, NANOSECONDS_PER_SECOND, 40000000));
++}
++
++static void timg_wdt_expired(void *opaque)
++{
++    qemu_log_mask(LOG_GUEST_ERROR, "esp32s31: watchdog reset\n");
++    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++}
++
++static uint64_t timg_read(void *opaque, hwaddr addr, unsigned size)
++{
++    S31Timg *t = opaque;
++
++    return addr < sizeof(t->regs) ? t->regs[addr / 4] : 0;
++}
++
++static void timg_write(void *opaque, hwaddr addr, uint64_t val,
++                       unsigned size)
++{
++    S31Timg *t = opaque;
++    const bool unlocked = t->regs[TIMG_WDTWPROTECT / 4] == WDT_WKEY;
++
++    if (addr >= sizeof(t->regs)) {
++        return;
++    }
++    switch (addr) {
++    case TIMG_WDTWPROTECT:
++        t->regs[addr / 4] = val;
++        break;
++    case TIMG_WDTCONFIG0:
++    case TIMG_WDTCONFIG1:
++    case TIMG_WDTCONFIG2:
++        if (unlocked) {
++            t->regs[addr / 4] = val & ~WDT_CONF_UPDATE;
++            timg_wdt_arm(t);
++        }
++        break;
++    case TIMG_WDTFEED:
++        if (unlocked) {
++            timg_wdt_arm(t);
++        }
++        break;
++    case TIMG_RTCCALICFG:
++        t->regs[addr / 4] = val & ~CALI_RDY;
++        if (val & CALI_START) {
++            uint64_t n = (val >> 16) & 0x7fff;
++
++            t->regs[TIMG_RTCCALICFG1 / 4] =
++                (uint32_t)(n * 40000000 / S31_RC_SLOW_HZ) << 7;
++            t->regs[addr / 4] |= CALI_RDY;
++        }
++        break;
++    default:
++        t->regs[addr / 4] = val;
++        break;
++    }
++}
++
++static const MemoryRegionOps timg_ops = {
++    .read = timg_read,
++    .write = timg_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* ------------------------------------------- IO_MUX, LP_SYS, RTC timer */
++
++static uint64_t iomux_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    return s->iomux_regs[addr / 4];
++}
++
++static void iomux_write(void *opaque, hwaddr addr, uint64_t val,
++                        unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    s->iomux_regs[addr / 4] = val;
++}
++
++static const MemoryRegionOps iomux_ops = {
++    .read = iomux_read,
++    .write = iomux_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static uint64_t lpsys_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    return s->lpsys_regs[addr / 4];
++}
++
++static void lpsys_write(void *opaque, hwaddr addr, uint64_t val,
++                        unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    s->lpsys_regs[addr / 4] = val;
++}
++
++static const MemoryRegionOps lpsys_ops = {
++    .read = lpsys_read,
++    .write = lpsys_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* The RTC timer counts the 136 kHz slow clock from power-up. */
++#define RTC_UPDATE          0x10
++#define  RTC_MAIN_TIMER_UPDATE  (1u << 27)
++#define RTC_MAIN_BUF0_LOW   0x14
++#define RTC_MAIN_BUF0_HIGH  0x18
++
++static uint64_t rtctimer_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    return addr < sizeof(s->rtc_regs) ? s->rtc_regs[addr / 4] : 0;
++}
++
++static void rtctimer_write(void *opaque, hwaddr addr, uint64_t val,
++                           unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    if (addr >= sizeof(s->rtc_regs)) {
++        return;
++    }
++    if (addr == RTC_UPDATE && (val & RTC_MAIN_TIMER_UPDATE)) {
++        uint64_t ticks = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
++                                  S31_RC_SLOW_HZ, NANOSECONDS_PER_SECOND);
++
++        s->rtc_regs[RTC_MAIN_BUF0_LOW / 4] = ticks;
++        s->rtc_regs[RTC_MAIN_BUF0_HIGH / 4] = (ticks >> 32) & 0xffff;
++        val &= ~RTC_MAIN_TIMER_UPDATE;
++    }
++    s->rtc_regs[addr / 4] = val;
++}
++
++static const MemoryRegionOps rtctimer_ops = {
++    .read = rtctimer_read,
++    .write = rtctimer_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
+ /* ------------------------------------------------------- SPI1 (flash) */
+ 
+ /*
+@@ -1157,10 +1387,28 @@ static void esp32s31_reset(void *opaque)
+     s->st_int_ena = s->st_int_raw = 0;
+     s->st_loaded = false;
+     timer_del(s->st_timer);
+-    s->rx_count = s->rx_head = 0;
+-    s->uart_int_ena = s->uart_int_raw = 0;
+-    memset(s->uart_regs, 0, sizeof(s->uart_regs));
+-    s->uart_regs[UART_CONF1 / 4] = 0x60 | (0x60 << 10);
++    for (int i = 0; i < 2; i++) {
++        S31Timg *t = &s->timg[i];
++
++        if (t->wdt) {
++            timer_del(t->wdt);
++        }
++        memset(t->regs, 0, sizeof(t->regs));
++        t->regs[TIMG_WDTWPROTECT / 4] = WDT_WKEY;
++        t->regs[TIMG_WDTCONFIG1 / 4] = 1u << 16;
++    }
++    for (int i = 0; i < S31_IOMUX_SIZE / 4; i++) {
++        s->iomux_regs[i] = 1u << 12;        /* MCU_SEL: GPIO */
++    }
++    for (int i = 0; i < 4; i++) {
++        S31Uart *u = &s->uart[i];
++
++        u->rx_count = u->rx_head = 0;
++        u->int_ena = u->int_raw = 0;
++        memset(u->regs, 0, sizeof(u->regs));
++        u->regs[UART_CONF1 / 4] = 0x60 | (0x60 << 8);
++        u->regs[UART_CONF0 / 4] = 0x1c;
++    }
+     s->usj_tx_len = s->usj_rx_head = s->usj_rx_count = 0;
+     s->usj_int_raw = s->usj_int_ena = 0;
+     memset(s->gpio_regs, 0, sizeof(s->gpio_regs));
+@@ -1331,9 +1579,17 @@ static void esp32s31_machine_init(MachineState *machine)
+     memory_region_init_io(&s->systimer_mr, NULL, &systimer_ops, s,
+                           "esp32s31.systimer", S31_SYSTIMER_SIZE);
+     memory_region_add_subregion(sysmem, S31_SYSTIMER_BASE, &s->systimer_mr);
+-    memory_region_init_io(&s->uart_mr, NULL, &uart_ops, s,
+-                          "esp32s31.uart0", S31_UART_SIZE);
+-    memory_region_add_subregion(sysmem, S31_UART0_BASE, &s->uart_mr);
++    for (int i = 0; i < 4; i++) {
++        S31Uart *u = &s->uart[i];
++        g_autofree char *name = g_strdup_printf("esp32s31.uart%d", i);
++
++        u->s = s;
++        u->src = S31_SRC_UART0 + i;
++        memory_region_init_io(&u->mr, NULL, &uart_ops, u, name,
++                              S31_UART_SIZE);
++        memory_region_add_subregion(sysmem, S31_UART0_BASE + i * 0x1000,
++                                    &u->mr);
++    }
+     memory_region_init_io(&s->lpaon_mr, NULL, &lpaon_ops, s,
+                           "esp32s31.lpaon", S31_LPAON_SIZE);
+     memory_region_add_subregion(sysmem, S31_LPAON_BASE, &s->lpaon_mr);
+@@ -1349,6 +1605,26 @@ static void esp32s31_machine_init(MachineState *machine)
+     memory_region_init_io(&s->spi1_mr, NULL, &spi1_ops, s,
+                           "esp32s31.spi1", S31_SPI1_SIZE);
+     memory_region_add_subregion(sysmem, S31_SPI1_BASE, &s->spi1_mr);
++    for (int i = 0; i < 2; i++) {
++        S31Timg *t = &s->timg[i];
++        g_autofree char *name = g_strdup_printf("esp32s31.timg%d", i);
++
++        t->s = s;
++        t->wdt = timer_new_ns(QEMU_CLOCK_VIRTUAL, timg_wdt_expired, t);
++        memory_region_init_io(&t->mr, NULL, &timg_ops, t, name,
++                              S31_TIMG_SIZE);
++        memory_region_add_subregion(sysmem, S31_TIMG0_BASE + i * 0x1000,
++                                    &t->mr);
++    }
++    memory_region_init_io(&s->iomux_mr, NULL, &iomux_ops, s,
++                          "esp32s31.iomux", S31_IOMUX_SIZE);
++    memory_region_add_subregion(sysmem, S31_IOMUX_BASE, &s->iomux_mr);
++    memory_region_init_io(&s->lpsys_mr, NULL, &lpsys_ops, s,
++                          "esp32s31.lp_sys", S31_LPSYS_SIZE);
++    memory_region_add_subregion(sysmem, S31_LPSYS_BASE, &s->lpsys_mr);
++    memory_region_init_io(&s->rtctimer_mr, NULL, &rtctimer_ops, s,
++                          "esp32s31.rtc_timer", S31_RTCTIMER_SIZE);
++    memory_region_add_subregion(sysmem, S31_RTCTIMER_BASE, &s->rtctimer_mr);
+ 
+     /*
+      * Ethernet: the EMAC is a DesignWare GMAC 3.70a, close enough to the
+@@ -1429,9 +1705,15 @@ static void esp32s31_machine_init(MachineState *machine)
+ 
+     s->st_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, systimer_timer_cb, s);
+ 
+-    qemu_chr_fe_init(&s->chr, serial_hd(0), &error_fatal);
+-    qemu_chr_fe_set_handlers(&s->chr, uart_can_receive, uart_receive,
+-                             NULL, NULL, s, NULL, true);
++    for (int i = 0; i < 4; i++) {
++        S31Uart *u = &s->uart[i];
++
++        /* serial ports: UART0, USB-Serial/JTAG, UART1, UART2, UART3 */
++        qemu_chr_fe_init(&u->chr, serial_hd(i == 0 ? 0 : i + 1),
++                         &error_fatal);
++        qemu_chr_fe_set_handlers(&u->chr, uart_can_receive, uart_receive,
++                                 NULL, NULL, u, NULL, true);
++    }
+ 
+     /* The USB-Serial/JTAG port is the second serial port (-serial). */
+     qemu_chr_fe_init(&s->usj_chr, serial_hd(1), &error_fatal);
+-- 
+2.43.0
+

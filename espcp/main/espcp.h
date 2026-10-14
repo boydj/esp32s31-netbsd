@@ -34,4 +34,8 @@ void espcp_bt_init(void);
 void espcp_bt_ctl(uint8_t type, uint32_t seq, const void *data, size_t len);
 void espcp_bt_tx(const void *h4, size_t len);
 
+/* sensors.c */
+void espcp_sensors_init(void);
+void espcp_sensors_ctl(uint8_t type, uint32_t seq, const void *data, size_t len);
+
 extern uint32_t espcp_stat_wifi_rx_drop, espcp_stat_wifi_tx_err;
