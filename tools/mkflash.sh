@@ -6,13 +6,15 @@
 #   0x002000  SPL app (U-Boot SPL in Espressif image format)
 #   0x100000  u-boot.itb (OpenSBI fw_dynamic + U-Boot + U-Boot dtb)
 #   0x300000  device tree for the kernel  (XIP 0x40200000)
-#   0x500000  kernel Image                (XIP 0x40400000, booti)
+#   0x500000  kernel Image                (XIP 0x40400000, booti), <= 3MiB
+#   0x800000  root file system (FFS)      (XIP 0x40700000), <= 8MiB
 #
-# usage: mkflash.sh u-boot-spl-dtb.bin u-boot.itb kernel.dtb kernel.img out.bin
+# usage: mkflash.sh u-boot-spl-dtb.bin u-boot.itb kernel.dtb kernel.img \
+#            rootfs.img out.bin
 #
 set -eu
 
-SPL=$1 ITB=$2 DTB=$3 IMG=$4 OUT=$5
+SPL=$1 ITB=$2 DTB=$3 IMG=$4 ROOTFS=$5 OUT=$6
 TOOLDIR=${TOOLDIR:?set TOOLDIR to the NetBSD tool directory}
 CROSS=${CROSS:-$TOOLDIR/bin/riscv32--netbsd-}
 ESPTOOL=${ESPTOOL:-esptool}
@@ -30,11 +32,14 @@ FLASHARGS="--flash-mode dio --flash-freq 80m --flash-size 16MB"
 # file size in bytes (portable: GNU and BSD stat disagree)
 fsize() { wc -c < "$1" | tr -d ' '; }
 
-imgsz=$(fsize "$IMG")
-if [ "$imgsz" -gt $((0x1000000 - 0x500000)) ]; then
-	echo "kernel image too big ($imgsz bytes)" >&2
-	exit 1
-fi
+toobig() {	# file limit what
+	if [ "$(fsize "$1")" -gt "$2" ]; then
+		echo "mkflash.sh: $3 too big ($(fsize "$1") > $2 bytes)" >&2
+		exit 1
+	fi
+}
+toobig "$IMG" $((0x800000 - 0x500000)) "kernel image"
+toobig "$ROOTFS" $((0x1000000 - 0x800000)) "root file system"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -52,5 +57,6 @@ $ESPTOOL --chip esp32s31 merge-bin -o "$OUT" --format raw $FLASHARGS \
     0x002000 "$tmp/spl_app.bin" \
     0x100000 "$ITB" \
     0x300000 "$DTB" \
-    0x500000 "$IMG"
+    0x500000 "$IMG" \
+    0x800000 "$ROOTFS"
 echo "wrote $OUT ($(fsize "$OUT") bytes)"
