@@ -29,14 +29,16 @@ cd "$W"
 [ -d netbsd-src ] ||
 	git clone --depth 1 -b "$NETBSD_BRANCH" "$NETBSD_URL" netbsd-src
 
-pinned() {	# dir url branch rev
+pinned() {	# dir url rev	(the revision tested with; see *_BRANCH)
 	if [ ! -d "$1" ]; then
-		git clone --depth 50 -b "$3" "$2" "$1"
+		git init -q "$1"
+		git -C "$1" remote add origin "$2"
 	fi
-	git -C "$1" checkout -q "$4"
+	git -C "$1" fetch -q --depth 1 origin "$3"
+	git -C "$1" checkout -q FETCH_HEAD
 }
-pinned opensbi-esp "$OPENSBI_URL" "$OPENSBI_BRANCH" "$OPENSBI_REV"
-pinned uboot-esp "$UBOOT_URL" "$UBOOT_BRANCH" "$UBOOT_REV"
+pinned opensbi-esp "$OPENSBI_URL" "$OPENSBI_REV"
+pinned uboot-esp "$UBOOT_URL" "$UBOOT_REV"
 
 if [ ! -d qemu ]; then
 	git clone --depth 1 -b "$QEMU_TAG" "$QEMU_URL" qemu
