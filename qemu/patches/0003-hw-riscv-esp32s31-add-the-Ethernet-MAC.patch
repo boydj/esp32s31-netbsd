@@ -1,0 +1,139 @@
+From 7e303dea31540e417d97b056b50d21db1c5f3eb2 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Tue, 13 Oct 2026 23:54:47 -0400
+Subject: [PATCH 3/3] hw/riscv/esp32s31: add the Ethernet MAC
+
+Model the ESP32-S31's DesignWare GMAC with the existing NPCM GMAC model
+(DWC GMAC 3.x with normal descriptors) at 0x20350000, wired to interrupt
+matrix source 98.  The model gets its own Kconfig symbol, NPCM_GMAC, so
+that machines other than the NPCM7xx can select it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/arm/Kconfig      |  1 +
+ hw/net/Kconfig      |  3 +++
+ hw/net/meson.build  |  3 ++-
+ hw/riscv/Kconfig    |  1 +
+ hw/riscv/esp32s31.c | 28 ++++++++++++++++++++++++++++
+ 5 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 6f5b2ad..8e0134e 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -460,6 +460,7 @@ config NPCM7XX
+     bool
+     default y
+     depends on TCG && ARM
++    select NPCM_GMAC
+     select A9MPCORE
+     select ADM1266
+     select ADM1272
+diff --git a/hw/net/Kconfig b/hw/net/Kconfig
+index b56a173..6c7df7d 100644
+--- a/hw/net/Kconfig
++++ b/hw/net/Kconfig
+@@ -162,3 +162,6 @@ config CAN_FLEXCAN
+     bool
+     depends on IMX
+     select CAN_BUS
++
++config NPCM_GMAC
++    bool
+diff --git a/hw/net/meson.build b/hw/net/meson.build
+index 84f142d..f8cfe26 100644
+--- a/hw/net/meson.build
++++ b/hw/net/meson.build
+@@ -37,7 +37,8 @@ system_ss.add(when: 'CONFIG_I82596_COMMON', if_true: files('i82596.c'))
+ system_ss.add(when: 'CONFIG_SUNHME', if_true: files('sunhme.c'))
+ system_ss.add(when: 'CONFIG_FTGMAC100', if_true: files('ftgmac100.c'))
+ system_ss.add(when: 'CONFIG_SUNGEM', if_true: files('sungem.c'))
+-system_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx_emc.c', 'npcm_gmac.c'))
++system_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx_emc.c'))
++system_ss.add(when: 'CONFIG_NPCM_GMAC', if_true: files('npcm_gmac.c'))
+ system_ss.add(when: 'CONFIG_NPCM8XX', if_true: files('npcm_pcs.c'))
+ 
+ system_ss.add(when: 'CONFIG_COLDFIRE', if_true: files('mcf_fec.c'))
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+index 6601fbd..00cd2e2 100644
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -75,6 +75,7 @@ config ESP32S31
+     depends on RISCV32
+     select RISCV_ACLINT
+     select UNIMP
++    select NPCM_GMAC
+ 
+ config SHAKTI_C
+     bool
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index 4771bf1..7f342c2 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -36,6 +36,10 @@
+ #include "qemu/error-report.h"
+ #include "qemu/timer.h"
+ #include "qemu/guest-random.h"
++#include "hw/core/irq.h"
++#include "hw/core/sysbus.h"
++#include "hw/net/npcm_gmac.h"
++#include "net/net.h"
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+ #include "hw/core/boards.h"
+@@ -68,6 +72,7 @@ enum {
+     S31_UART0_BASE      = 0x2038a000, S31_UART_SIZE   = 0x1000,
+     S31_SYSTIMER_BASE   = 0x20399000, S31_SYSTIMER_SIZE = 0x100,
+     S31_TRNG_BASE       = 0x20814000, S31_TRNG_SIZE   = 0x100,
++    S31_EMAC_BASE       = 0x20350000,
+     S31_INTMTX_BASE     = 0x20585000, S31_INTMTX_SIZE = 0x800,
+     S31_LPAON_BASE      = 0x20701000, S31_LPAON_SIZE  = 0x1000,
+     S31_MTIMER_BASE     = 0x3f000000, /* not on the chip; backs the time CSR */
+@@ -78,6 +83,7 @@ enum {
+ #define S31_TIMEBASE_FREQ   320000000
+ #define S31_SRC_UART0       9
+ #define S31_SRC_SYSTIMER0   33
++#define S31_SRC_EMAC        98
+ 
+ #define CLIC_NIDS           64
+ #define INTMTX_NSRC         128
+@@ -340,6 +346,12 @@ static void esp32s31_set_source(Esp32s31State *s, int src, bool level)
+     }
+ }
+ 
++/* A qemu_irq for interrupt matrix source n, for QOM devices. */
++static void esp32s31_source_irq(void *opaque, int n, int level)
++{
++    esp32s31_set_source(opaque, n, level);
++}
++
+ static uint64_t intmtx_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     Esp32s31State *s = opaque;
+@@ -907,6 +919,22 @@ static void esp32s31_machine_init(MachineState *machine)
+                           "esp32s31.trng", S31_TRNG_SIZE);
+     memory_region_add_subregion(sysmem, S31_TRNG_BASE, &s->trng_mr);
+ 
++    /*
++     * Ethernet: the EMAC is a DesignWare GMAC 3.70a, close enough to the
++     * GMAC that QEMU models for the Nuvoton NPCM SoCs (normal descriptors,
++     * an internal PHY at address 0).  Takes the default -nic.
++     */
++    {
++        DeviceState *gmac = qdev_new(TYPE_NPCM_GMAC);
++
++        qemu_configure_nic_device(gmac, true, NULL);
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(gmac), &error_fatal);
++        sysbus_mmio_map(SYS_BUS_DEVICE(gmac), 0, S31_EMAC_BASE);
++        sysbus_connect_irq(SYS_BUS_DEVICE(gmac), 0,
++                           qemu_allocate_irq(esp32s31_source_irq, s,
++                                             S31_SRC_EMAC));
++    }
++
+     s->st_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, systimer_timer_cb, s);
+ 
+     qemu_chr_fe_init(&s->chr, serial_hd(0), &error_fatal);
+-- 
+2.43.0
+

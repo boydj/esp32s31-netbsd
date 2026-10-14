@@ -10,6 +10,11 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 W=${W:-$REPO/work}
 J=${J:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}
 
+if ! pkg-config --exists slirp 2>/dev/null; then
+	echo "warning: libslirp not found; QEMU will be built without" \
+	    "user-mode networking (-nic user)" >&2
+fi
+
 mkdir -p "$W/qemu/build"
 cd "$W/qemu/build"
 [ -f build.ninja ] || ../configure --target-list=riscv32-softmmu \

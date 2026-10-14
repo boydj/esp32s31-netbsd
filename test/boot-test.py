@@ -4,7 +4,7 @@ Boot the ESP32-S31 flash image in QEMU's esp32s31 machine, log in on the
 serial console and run a few commands.
 
 usage: boot-test.py [--qemu PATH | --esp-emu PATH] [--flash FILE]
-                    [--reboots N] [--vi] [cmd ...]
+                    [--reboots N] [--vi] [--net] [--fptest] [cmd ...]
 """
 import argparse
 import os
@@ -28,6 +28,11 @@ ap.add_argument("--vi", action="store_true",
                 help="edit and save a file with vi over the console")
 ap.add_argument("--reboots", type=int, default=0,
                 help="warm-reboot this many times (stale RAM) before halting")
+ap.add_argument("--net", action="store_true",
+                help="attach user-mode networking and check DHCP and ping "
+                     "(QEMU needs libslirp)")
+ap.add_argument("--fptest", action="store_true",
+                help="run the FPU context-switch test")
 ap.add_argument("cmds", nargs="*")
 a = ap.parse_args()
 
@@ -50,6 +55,8 @@ if a.esp_emu:
 else:
     argv = [a.qemu, "-M", "esp32s31,flash=" + a.flash + a.machopts,
             "-nographic", "-serial", "mon:stdio", "-monitor", "none"]
+    if a.net:
+        argv += ["-nic", "user"]
 child = pexpect.spawn(argv[0], argv[1:], timeout=a.timeout)
 child.logfile_read = log
 
@@ -64,6 +71,22 @@ for c in cmds:
     child.expect("esp32s31# ")
     out = child.before.decode(errors="replace")
     print(f"$ {c}\n{out.split(chr(10), 1)[1] if chr(10) in out else out}")
+def check(name, cmd, want, timeout=120):
+    child.sendline(cmd)
+    child.expect("esp32s31# ", timeout=timeout)
+    out = child.before.decode(errors="replace").split("\n", 1)[-1]
+    ok = want in out
+    print(f"{name}: {'ok' if ok else 'FAILED'}", flush=True)
+    if not ok:
+        print(out)
+if a.fptest:
+    check("fptest", "fptest", "fptest: ok")
+if a.net:
+    # The guest's dhcpcd runs in the background; give it time to finish.
+    check("dhcp", "i=0; while ! netstat -rn -f inet | grep -q ^default &&"
+          " [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done;"
+          " netstat -rn -f inet | grep ^default", "default", 180)
+    check("ping", "ping -c 3 -w 10 10.0.2.2", "packet loss")
 if a.vi:
     # full-screen editor over the serial console
     child.sendline("TERM=vt100 vi /tmp/vi-test")

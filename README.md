@@ -26,17 +26,30 @@ been run on silicon yet.**
 | [esp-emulator](https://github.com/espressif/esp-emulator) v0.49.0, real ESP32-S31 mask ROM | boots, multi-user, all tests pass |
 | Real hardware | untested |
 
-What works: the Sv32 MMU with fork/exec and paging out of memory (OOM
-kills are handled), the CLIC and interrupt matrix, the SYSTIMER
-(timecounter, hardclock, `delay(9)`), the UART0 console (interrupt-driven
-RX/TX, tested with a 20 KB input flood), the hardware TRNG as an entropy
-source, and warm reboot via SBI.  The ramdisk has `sh`, `vi`, `awk`,
-`sed`, `grep`, `less`, `ps`, `vmstat`, `sysctl`, ... with tmpfs on
-`/tmp` and `/var`.
+What works:
 
-Not supported yet: the second hart (SMP), the FPU (userland is
-soft-float), Wi-Fi/BLE, Ethernet, SD/MMC, using the flash as a disk,
-GPIO, the USB Serial/JTAG console, and an RTC.
+* the Sv32 MMU with fork/exec and paging out of memory (OOM kills are
+  handled), the CLIC and interrupt matrix, the SYSTIMER (timecounter,
+  hardclock, `delay(9)`), warm reboot via SBI;
+* the UART0 console (interrupt-driven RX/TX, tested with a 20 KB input
+  flood) and the hardware TRNG as an entropy source;
+* the single-precision FPU: FP state is saved per process, lazily when
+  the core traps FP instructions with `sstatus.FS` off, eagerly when it
+  doesn't (`fptest` checks it);
+* the root file system read straight out of SPI flash through the XIP
+  window, so all of PSRAM is left for the kernel and processes;
+* Gigabit Ethernet (DesignWare GMAC, RGMII): clocks, resets, pin
+  muxing, the PHY reset GPIO and the factory MAC address from eFuse, with
+  `dhcpcd` at boot and `ping`, `ftp` (HTTP), `nc`, `route`, `arp`;
+* GPIO through `gpioctl(8)`.
+
+The root file system has `sh`, `vi`, `awk`, `sed`, `grep`, `less`, `ps`,
+`vmstat`, `sysctl`, ... and is read-only; `/tmp`, `/var` and `/root` are
+tmpfs.
+
+Not supported yet: the second hart (SMP), Wi-Fi/BLE (no public
+programming information), SD/MMC, writing to the flash, USB, the USB
+Serial/JTAG console, and an RTC.
 
 ```
 ESP-ROM:esp32s31-20251218
@@ -75,7 +88,9 @@ esptool --chip esp32s31 --port /dev/ttyUSB0 --baud 1152000 \
 ```
 
 The console is UART0 at 115200 8N1.  Log in as `root` (no password).
-The root file system is a memory disk: changes are lost at reset.
+The root file system is read-only; `/tmp`, `/var` and `/root` are in
+memory, so changes are lost at reset.  Plug the Ethernet port into a
+network with a DHCP server and the board configures itself.
 
 The image uses the flash layout of Espressif's Linux BSP, so it replaces
 whatever was there:
@@ -85,7 +100,8 @@ whatever was there:
 | `0x002000` | U-Boot SPL (ESP image, DIO/80 MHz) |
 | `0x100000` | `u-boot.itb`: OpenSBI `fw_dynamic` + U-Boot |
 | `0x300000` | device tree (`esp32s31.dts`) |
-| `0x500000` | `netbsd-esp32s31.img`: loader + kernel + 3 MiB ramdisk |
+| `0x500000` | `netbsd-esp32s31.img`: loader + kernel (at most 4 MiB) |
+| `0x900000` | root file system, FFS (at most 7 MiB) |
 
 ## Building
 
@@ -98,15 +114,15 @@ or step by step (`W` selects the work directory, `J` the parallelism):
 | script | does |
 |---|---|
 | `tools/fetch-sources.sh` | clones the NetBSD branch, Espressif OpenSBI/U-Boot (pinned), QEMU v11.1.2 + `qemu/patches` |
-| `tools/build-netbsd.sh` | cross toolchain, the few static libraries the ramdisk needs, the crunched ramdisk, the `ESP32S31` kernel |
+| `tools/build-netbsd.sh` | cross toolchain, the few static libraries the root file system needs, the crunched root file system, the `ESP32S31` kernel |
 | `tools/build-firmware.sh` | OpenSBI and U-Boot, with the NetBSD toolchain |
-| `tools/assemble.sh` | kernel + ramdisk → loader image → `work/out/s31_netbsd_flash.bin` |
+| `tools/assemble.sh` | kernel → loader image, + root file system → `work/out/s31_netbsd_flash.bin` |
 | `tools/build-qemu.sh` | `qemu-system-riscv32` with the `esp32s31` machine |
 
 Host requirements: a C/C++ compiler, git, GNU make 4 or later, bison,
 flex, swig, OpenSSL headers, Python 3 with `setuptools`, `pyelftools`,
 `esptool` 5.x and `pexpect` (tests), and for QEMU: ninja, pkg-config,
-glib and pixman.  If gitlab.com is unreachable, set
+glib, pixman and libslirp (for `-nic user`).  If gitlab.com is unreachable, set
 `QEMU_WRAP_MIRROR=github` for QEMU's subprojects.
 
 On **macOS** (Homebrew), the system `make` is GNU make 3.81, too old for
@@ -115,7 +131,7 @@ the first with ESP32-S31 support.  The scripts pick up Homebrew's `gmake`
 and its keg-only bison, flex and OpenSSL automatically:
 
 ```sh
-brew install make bison flex swig openssl@3 pkgconf ninja glib pixman python
+brew install make bison flex swig openssl@3 pkgconf ninja glib pixman libslirp python
 $(brew --prefix)/bin/python3 -m venv --clear .venv && . .venv/bin/activate
 pip install setuptools pyelftools 'esptool>=5' pexpect
 ./build-all.sh
@@ -128,28 +144,30 @@ takes a few minutes.
 
 ```sh
 # QEMU model
-test/boot-test.py --reboots 2 --vi
+test/boot-test.py --reboots 2 --vi --fptest --net
 test/boot-test.py --machopts ",asid=off"     # a core without ASIDs
 test/rx-flood.py                             # UART RX stress
 
 # Espressif's esp-emulator (real mask ROM)
-test/boot-test.py --esp-emu ~/.local/bin/esp-emu --reboots 1 --vi
+test/boot-test.py --esp-emu ~/.local/bin/esp-emu --reboots 1 --vi --fptest --net
 ```
 
 `boot-test.py` boots the image, logs in, runs commands (pass your own as
-arguments), optionally edits a file with `vi` over the console and
+arguments), optionally runs the FPU test, checks DHCP and ping over the
+emulated Ethernet, edits a file with `vi` over the console and
 warm-reboots, then halts.  To play with it interactively:
 
 ```sh
 work/qemu/build/qemu-system-riscv32 -M esp32s31,flash=work/out/s31_netbsd_flash.bin \
-    -nographic -serial mon:stdio -monitor none
+    -nographic -serial mon:stdio -monitor none -nic user
 esp-emu --chip esp32s31 --firmware work/out/s31_netbsd_flash.bin --net user
 ```
 
 The QEMU machine (`qemu/patches`) models the parts NetBSD and the boot
 firmware use: CLIC-mode harts (stvec alignment, SPIL in scause, no
 sie/sip), the CLIC, interrupt matrix, SYSTIMER, UART0, TRNG, the reset
-register and the flash XIP window.  It emulates the SPL step itself: it
+register, the flash XIP window and the Ethernet MAC (QEMU's NPCM GMAC
+model, which is the same DesignWare core with normal descriptors).  It emulates the SPL step itself: it
 parses `u-boot.itb` and starts OpenSBI the way the SPL would.  esp-emulator
 runs the real mask ROM and SPL instead.  That makes it the more
 independent check of the boot path and the flash image format.
@@ -158,12 +176,16 @@ independent check of the boot path and the flash image format.
 
 * **Kernel**: `sys/arch/riscv/espressif` in the NetBSD branch.  CLIC
   (`espclic`, `espintmtx`), SYSTIMER (`espsystimer`), UART (`espuart`),
-  TRNG (`esptrng`), the FDT platform code, and `loader/loader.S`.  The
+  TRNG (`esptrng`), clocks and resets (`espclkrst`), GPIO and pin muxing
+  (`espgpio`), the Ethernet glue for `awge` (`esp_gmac.c`), the flash root
+  file system (`espxiproot`), the FDT platform code, and
+  `loader/loader.S`.  The
   loader turns the kernel into a RISC-V `Image` that U-Boot can `booti`
   straight from the flash XIP window, then copies it to PSRAM.
 * **Generic riscv changes** in the same branch: soft-float riscv32
   userland, Sv32 direct map and other RV32 VM fixes, `options RISCV_CLIC`,
-  pluggable timer/`delay(9)`, a `.bss` clearing fix in locore.  To check
+  pluggable timer/`delay(9)`, a `.bss` clearing fix in locore, and FPU
+  support for cores with F but not D.  To check
   they don't regress riscv64, `GENERIC64` was built and booted on QEMU's
   `virt` machine (2 harts) up to the root device prompt.
 * **Firmware**: Espressif's OpenSBI and U-Boot, built with the NetBSD
@@ -178,8 +200,11 @@ source code, not against hardware:
 
 * **ASIDs.**  The kernel uses them.  `asid=off` in QEMU checks that it
   still works when the core implements none.
-* **Caches.**  I-cache maintenance goes through OpenSBI's vendor
-  extension; there is no D-cache maintenance beyond that.
+* **Caches.**  I-cache and D-cache maintenance go through OpenSBI's
+  vendor extension.  DMA (Ethernet) is treated as non-coherent: `bus_dma`
+  writes back and invalidates PSRAM lines around every transfer.
+* **Ethernet.**  The pin mux, RGMII clocking and PHY reset follow
+  Espressif's Linux device tree for the devkit (Motorcomm YT8531 PHY).
 * **PMA/APM.**  These are left as OpenSBI and U-Boot configure them.
 * **TRNG.**  Entropy is credited at 1 bit per byte, after health tests.
 * **Console.**  The UART divisor is left as the ROM and U-Boot set it

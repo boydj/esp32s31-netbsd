@@ -1,7 +1,7 @@
 From 3fee2e9e74c5ff7a29a543d48f02e2a7e42da502 Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Tue, 13 Oct 2026 21:05:28 -0400
-Subject: [PATCH 2/2] hw/riscv/esp32s31: add a TRNG model and an "asid" machine
+Subject: [PATCH 2/3] hw/riscv/esp32s31: add a TRNG model and an "asid" machine
  option
 
 - TRNG at 0x20814000: the data register returns guest-random words

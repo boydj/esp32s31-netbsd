@@ -6,8 +6,8 @@
 #   0x002000  SPL app (U-Boot SPL in Espressif image format)
 #   0x100000  u-boot.itb (OpenSBI fw_dynamic + U-Boot + U-Boot dtb)
 #   0x300000  device tree for the kernel  (XIP 0x40200000)
-#   0x500000  kernel Image                (XIP 0x40400000, booti), <= 3MiB
-#   0x800000  root file system (FFS)      (XIP 0x40700000), <= 8MiB
+#   0x500000  kernel Image                (XIP 0x40400000, booti), <= 4MiB
+#   0x900000  root file system (FFS)      (XIP 0x40800000), <= 7MiB
 #
 # usage: mkflash.sh u-boot-spl-dtb.bin u-boot.itb kernel.dtb kernel.img \
 #            rootfs.img out.bin
@@ -38,8 +38,8 @@ toobig() {	# file limit what
 		exit 1
 	fi
 }
-toobig "$IMG" $((0x800000 - 0x500000)) "kernel image"
-toobig "$ROOTFS" $((0x1000000 - 0x800000)) "root file system"
+toobig "$IMG" $((0x900000 - 0x500000)) "kernel image"
+toobig "$ROOTFS" $((0x1000000 - 0x900000)) "root file system"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -58,5 +58,5 @@ $ESPTOOL --chip esp32s31 merge-bin -o "$OUT" --format raw $FLASHARGS \
     0x100000 "$ITB" \
     0x300000 "$DTB" \
     0x500000 "$IMG" \
-    0x800000 "$ROOTFS"
+    0x900000 "$ROOTFS"
 echo "wrote $OUT ($(fsize "$OUT") bytes)"
