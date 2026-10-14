@@ -361,6 +361,16 @@ if a.hw:
         check("rtc set", "date 203001020304.05 >/dev/null; date +%Y", "2030")
         print(f"rtc: login after {relogin():.1f}s", flush=True)
         check("rtc after reboot", "date +%Y%m%d", "20300102")
+        # Audio: QEMU's I2S captures a ramp (left n, right ~n) and plays
+        # at the sample rate.
+        check("audio record", "audiorecord -F wav -e slinear_le -P 16"
+              " -s 48000 -c 2 -t 1 /tmp/r.wav && hexdump -s 96044 -n 4"
+              " -e '4/1 \"%02x\"' /tmp/r.wav; echo", "c05d3fa2", 60)
+        check("audio play", "dd if=/dev/zero of=/tmp/z.raw bs=96000"
+              " count=2 2>/dev/null; s=$(date +%s); audioplay -f"
+              " -e slinear_le -P 16 -s 48000 -c 2 /tmp/z.raw &&"
+              " t=$(( $(date +%s) - s )) && [ $t -ge 1 -a $t -le 2 ] &&"
+              " echo played-in-time", "played-in-time", 60)
         # CAN: QEMU puts both controllers on one bus.
         check("can", "ifconfig esptwai0 up && ifconfig esptwai1 up &&"
               " (candump -n 2 -t 10 esptwai1 & sleep 1;"

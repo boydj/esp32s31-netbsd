@@ -1,0 +1,428 @@
+From cef6bf1e74a683e2ffdb5b648a8a852ea983673c Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 16:40:49 -0400
+Subject: [PATCH 16/16] hw/riscv/esp32s31: I2S and the AHB GDMA
+
+The DMA walks descriptor rings at the sample rate the I2S clock
+registers give: playback data is dropped, capture gets a ramp (left n,
+right ~n), with the end-of-frame interrupts the hardware has.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/riscv/esp32s31.c | 371 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 371 insertions(+)
+
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index 087d98b..d878366 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -91,6 +91,9 @@ enum {
+     S31_LEDC_SIZE       = 0x800,
+     S31_MCPWM0_BASE     = 0x20381000, S31_MCPWM_SIZE  = 0x1000,
+     S31_TWAI0_BASE      = 0x20394000, S31_TWAI_SIZE   = 0x1000,
++    S31_I2S0_BASE       = 0x20387000, S31_I2S_SIZE    = 0x1000,
++    S31_I2SCLK_BASE     = 0x205870e4, S31_I2SCLK_SIZE = 0x28,
++    S31_AHBDMA_BASE     = 0x20343000, S31_AHBDMA_SIZE = 0x1000,
+     S31_EMAC_BASE       = 0x20350000,
+     S31_USB_BASE        = 0x20300000,
+     S31_USJ_BASE        = 0x20391000, S31_USJ_SIZE    = 0x1000,
+@@ -112,6 +115,8 @@ enum {
+ #define S31_SRC_UART0       9
+ #define S31_SRC_SYSTIMER0   33
+ #define S31_SRC_TWAI0       18
++#define S31_SRC_AHBDMA_IN0  36
++#define S31_SRC_AHBDMA_OUT0 41
+ #define S31_SRC_TWAI1       20
+ #define S31_SRC_EMAC        98
+ #define S31_SRC_USB_OTGHS   99
+@@ -155,6 +160,23 @@ struct Esp32s31State {
+         uint32_t regs[S31_MCPWM_SIZE / 4];
+     } ledc[2], mcpwm[4];
+ 
++    /* I2S0/1, their clocks, and the AHB GDMA that feeds them */
++    struct S31I2s {
++        struct Esp32s31State *s;
++        int unit;
++        MemoryRegion mr;
++        uint32_t regs[0x100 / 4];
++        QEMUTimer *tx_timer, *rx_timer;
++        uint16_t sample;
++    } i2s[2];
++    MemoryRegion i2sclk_mr, ahbdma_mr;
++    uint32_t i2sclk_regs[S31_I2SCLK_SIZE / 4];
++    uint32_t ahbdma_regs[0x700 / 4];
++    struct {
++        uint32_t out_desc, in_desc;
++        bool out_on, in_on;
++    } ahbch[5];
++
+     /* TWAI: two CTU CAN FD cores on one CAN bus ("/machine/canbus") */
+     CtuCanCoreState twai[2];
+     MemoryRegion twai_mr[2];
+@@ -1272,6 +1294,332 @@ static const MemoryRegionOps zerodet_ops = {
+ };
+ 
+ typedef struct S31Regfile S31Regfile;
++typedef struct S31I2s S31I2s;
++
++/*
++ * I2S and the AHB GDMA: the DMA engine walks descriptor rings at the
++ * sample rate the I2S clock registers give (16-bit stereo frames).
++ * Playback data is taken and dropped; capture gets a ramp, left n and
++ * right ~n.  End-of-frame interrupts as the hardware has them.
++ */
++#define AHB_IN_INT_RAW(p)       (0x00 + 0x10 * (p))
++#define AHB_IN_INT_ST(p)        (0x04 + 0x10 * (p))
++#define AHB_IN_INT_ENA(p)       (0x08 + 0x10 * (p))
++#define AHB_IN_INT_CLR(p)       (0x0c + 0x10 * (p))
++#define AHB_OUT_INT_RAW(p)      (0x50 + 0x10 * (p))
++#define AHB_OUT_INT_ST(p)       (0x54 + 0x10 * (p))
++#define AHB_OUT_INT_ENA(p)      (0x58 + 0x10 * (p))
++#define AHB_OUT_INT_CLR(p)      (0x5c + 0x10 * (p))
++#define AHB_IN_CONF0(p)         (0x100 + 0x100 * (p))
++#define AHB_IN_LINK(p)          (0x110 + 0x100 * (p))
++#define AHB_IN_LINK_ADDR(p)     (0x114 + 0x100 * (p))
++#define AHB_IN_SUC_EOF_DES(p)   (0x11c + 0x100 * (p))
++#define AHB_IN_PERI_SEL(p)      (0x138 + 0x100 * (p))
++#define AHB_OUT_CONF0(p)        (0x180 + 0x100 * (p))
++#define AHB_OUT_LINK(p)         (0x190 + 0x100 * (p))
++#define AHB_OUT_LINK_ADDR(p)    (0x194 + 0x100 * (p))
++#define AHB_OUT_EOF_DES(p)      (0x19c + 0x100 * (p))
++#define AHB_OUT_PERI_SEL(p)     (0x1b8 + 0x100 * (p))
++#define I2S_RX_CONF             0x20
++#define I2S_TX_CONF             0x24
++#define  I2S_CONF_START         (1u << 2)
++#define  I2S_CONF_WT            ((1u << 0) | (1u << 1) | (1u << 8))
++#define DESC_SUC_EOF            (1u << 30)
++
++static void ahbdma_update_irq(Esp32s31State *s, int p)
++{
++    uint32_t *r = s->ahbdma_regs;
++
++    esp32s31_set_source(s, S31_SRC_AHBDMA_IN0 + p,
++                        (r[AHB_IN_INT_RAW(p) / 4] &
++                         r[AHB_IN_INT_ENA(p) / 4]) != 0);
++    esp32s31_set_source(s, S31_SRC_AHBDMA_OUT0 + p,
++                        (r[AHB_OUT_INT_RAW(p) / 4] &
++                         r[AHB_OUT_INT_ENA(p) / 4]) != 0);
++}
++
++/* The channel pair serving this I2S port, or -1. */
++static int i2s_pair(S31I2s *i, bool out)
++{
++    const uint32_t sel = i->unit ? 5 : 1;
++
++    for (int p = 0; p < 5; p++) {
++        if (i->s->ahbdma_regs[(out ? AHB_OUT_PERI_SEL(p) :
++                               AHB_IN_PERI_SEL(p)) / 4] == sel) {
++            return p;
++        }
++    }
++    return -1;
++}
++
++/* Frames a second: 40 MHz / (N + b/a) / BCK divider / 32 bits. */
++static uint64_t i2s_rate(S31I2s *i, bool tx)
++{
++    const uint32_t *c = &i->s->i2sclk_regs[i->unit * 5];
++    const uint32_t ctrl = tx ? c[3] : c[1], div = tx ? c[4] : c[2];
++    const uint32_t conf = i->regs[(tx ? I2S_TX_CONF : I2S_RX_CONF) / 4];
++    const uint32_t n = (ctrl >> 3) & 0xff, x = div & 0x1ff;
++    const uint32_t y = (div >> 9) & 0x1ff, z = (div >> 18) & 0x1ff;
++    const uint32_t bck = ((conf >> 21) & 0x3f) + 1;
++    double mdiv = n;
++
++    if (n == 0) {
++        return 48000;
++    }
++    if (z != 0) {
++        const uint32_t den = (x + 1) * z + y;
++        const uint32_t num = (div & (1u << 27)) ? den - z : z;
++
++        mdiv += (double)num / den;
++    }
++    return (uint64_t)(40e6 / mdiv / bck / 32 + 0.5);
++}
++
++static bool i2s_read_desc(uint32_t addr, uint32_t d[3])
++{
++    if (address_space_read(&address_space_memory, addr,
++                           MEMTXATTRS_UNSPECIFIED, d, 12) != MEMTX_OK) {
++        return false;
++    }
++    for (int k = 0; k < 3; k++) {
++        d[k] = le32_to_cpu(d[k]);
++    }
++    return true;
++}
++
++/* Schedule the end of the current descriptor's worth of frames. */
++static void i2s_schedule(S31I2s *i, bool tx)
++{
++    Esp32s31State *s = i->s;
++    QEMUTimer *t = tx ? i->tx_timer : i->rx_timer;
++    const int p = i2s_pair(i, tx);
++    uint32_t d[3], len;
++
++    if (p < 0 || timer_pending(t) ||
++        !(tx ? s->ahbch[p].out_on : s->ahbch[p].in_on) ||
++        !(i->regs[(tx ? I2S_TX_CONF : I2S_RX_CONF) / 4] & I2S_CONF_START) ||
++        !i2s_read_desc(tx ? s->ahbch[p].out_desc : s->ahbch[p].in_desc, d)) {
++        return;
++    }
++    len = tx ? (d[0] >> 12) & 0xfff : d[0] & 0xfff;
++    timer_mod(t, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++              muldiv64(MAX(len / 4, 1), NANOSECONDS_PER_SECOND,
++                       i2s_rate(i, tx)));
++}
++
++static void i2s_tx_tick(void *opaque)
++{
++    S31I2s *i = opaque;
++    Esp32s31State *s = i->s;
++    const int p = i2s_pair(i, true);
++    uint32_t d[3];
++
++    if (p < 0 || !s->ahbch[p].out_on ||
++        !i2s_read_desc(s->ahbch[p].out_desc, d)) {
++        return;
++    }
++    if (d[0] & DESC_SUC_EOF) {
++        s->ahbdma_regs[AHB_OUT_EOF_DES(p) / 4] = s->ahbch[p].out_desc;
++        s->ahbdma_regs[AHB_OUT_INT_RAW(p) / 4] |= 1u << 1;  /* OUT_EOF */
++        ahbdma_update_irq(s, p);
++    }
++    s->ahbch[p].out_desc = d[2];
++    if (d[2] == 0) {
++        s->ahbch[p].out_on = false;
++        return;
++    }
++    i2s_schedule(i, true);
++}
++
++static void i2s_rx_tick(void *opaque)
++{
++    S31I2s *i = opaque;
++    Esp32s31State *s = i->s;
++    const int p = i2s_pair(i, false);
++    uint32_t d[3], size;
++    uint8_t buf[4096];
++
++    if (p < 0 || !s->ahbch[p].in_on ||
++        !i2s_read_desc(s->ahbch[p].in_desc, d)) {
++        return;
++    }
++    size = d[0] & 0xfff & ~3u;
++    for (uint32_t k = 0; k < size; k += 4, i->sample++) {
++        stw_le_p(buf + k, i->sample);
++        stw_le_p(buf + k + 2, (uint16_t)~i->sample);
++    }
++    address_space_write(&address_space_memory, d[1],
++                        MEMTXATTRS_UNSPECIFIED, buf, size);
++    d[0] = cpu_to_le32((d[0] & 0xfff) | (size << 12) | DESC_SUC_EOF);
++    address_space_write(&address_space_memory, s->ahbch[p].in_desc,
++                        MEMTXATTRS_UNSPECIFIED, &d[0], 4);
++    s->ahbdma_regs[AHB_IN_SUC_EOF_DES(p) / 4] = s->ahbch[p].in_desc;
++    s->ahbdma_regs[AHB_IN_INT_RAW(p) / 4] |= 1u << 1;      /* SUC_EOF */
++    ahbdma_update_irq(s, p);
++    s->ahbch[p].in_desc = d[2];
++    if (d[2] == 0) {
++        s->ahbch[p].in_on = false;
++        return;
++    }
++    i2s_schedule(i, false);
++}
++
++static uint64_t i2s_read(void *opaque, hwaddr addr, unsigned size)
++{
++    S31I2s *i = opaque;
++
++    return addr < sizeof(i->regs) ? i->regs[addr / 4] : 0;
++}
++
++static void i2s_write(void *opaque, hwaddr addr, uint64_t val,
++                      unsigned size)
++{
++    S31I2s *i = opaque;
++
++    if (addr >= sizeof(i->regs)) {
++        return;
++    }
++    if (addr == I2S_TX_CONF || addr == I2S_RX_CONF) {
++        val &= ~I2S_CONF_WT;                    /* self-clearing */
++        i->regs[addr / 4] = val;
++        if (!(val & I2S_CONF_START)) {
++            timer_del(addr == I2S_TX_CONF ? i->tx_timer : i->rx_timer);
++        }
++        i2s_schedule(i, addr == I2S_TX_CONF);
++        return;
++    }
++    i->regs[addr / 4] = val;
++}
++
++static const MemoryRegionOps i2s_ops = {
++    .read = i2s_read,
++    .write = i2s_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static uint64_t i2sclk_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    return s->i2sclk_regs[addr / 4];
++}
++
++static void i2sclk_write(void *opaque, hwaddr addr, uint64_t val,
++                         unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    s->i2sclk_regs[addr / 4] = val;
++}
++
++static const MemoryRegionOps i2sclk_ops = {
++    .read = i2sclk_read,
++    .write = i2sclk_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static S31I2s *ahbdma_i2s(Esp32s31State *s, int p, bool out)
++{
++    const uint32_t sel = s->ahbdma_regs[(out ? AHB_OUT_PERI_SEL(p) :
++                                         AHB_IN_PERI_SEL(p)) / 4];
++
++    return sel == 1 ? &s->i2s[0] : sel == 5 ? &s->i2s[1] : NULL;
++}
++
++static uint64_t ahbdma_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    if (addr >= sizeof(s->ahbdma_regs)) {
++        return 0;
++    }
++    if (addr < 0xa0 && (addr & 0xc) == 0x4) {          /* INT_ST */
++        return s->ahbdma_regs[(addr - 4) / 4] & s->ahbdma_regs[(addr + 4) / 4];
++    }
++    return s->ahbdma_regs[addr / 4];
++}
++
++static void ahbdma_write(void *opaque, hwaddr addr, uint64_t val,
++                         unsigned size)
++{
++    Esp32s31State *s = opaque;
++    S31I2s *i;
++    int p;
++
++    if (addr >= sizeof(s->ahbdma_regs)) {
++        return;
++    }
++    if (addr < 0xa0) {
++        p = (addr % 0x50) / 0x10;
++        switch (addr & 0xc) {
++        case 0x0:                                   /* RAW: read only */
++        case 0x4:                                   /* ST */
++            return;
++        case 0xc:                                   /* CLR */
++            s->ahbdma_regs[(addr - 0xc) / 4] &= ~(uint32_t)val;
++            ahbdma_update_irq(s, p);
++            return;
++        default:                                    /* ENA */
++            s->ahbdma_regs[addr / 4] = val;
++            ahbdma_update_irq(s, p);
++            return;
++        }
++    }
++    if (addr >= 0x100 && addr < 0x600) {
++        p = (addr - 0x100) / 0x100;
++        switch ((addr - 0x100) % 0x100) {
++        case 0x10:                                  /* IN_LINK */
++            i = ahbdma_i2s(s, p, false);
++            if (val & (1u << 2)) {                  /* START */
++                s->ahbch[p].in_desc = s->ahbdma_regs[AHB_IN_LINK_ADDR(p) / 4];
++                s->ahbch[p].in_on = true;
++                if (i) {
++                    i2s_schedule(i, false);
++                }
++            }
++            if (val & (1u << 1)) {                  /* STOP */
++                s->ahbch[p].in_on = false;
++                if (i) {
++                    timer_del(i->rx_timer);
++                }
++            }
++            val &= 1;
++            break;
++        case 0x90:                                  /* OUT_LINK */
++            i = ahbdma_i2s(s, p, true);
++            if (val & (1u << 1)) {
++                s->ahbch[p].out_desc =
++                    s->ahbdma_regs[AHB_OUT_LINK_ADDR(p) / 4];
++                s->ahbch[p].out_on = true;
++                if (i) {
++                    i2s_schedule(i, true);
++                }
++            }
++            if (val & (1u << 0)) {
++                s->ahbch[p].out_on = false;
++                if (i) {
++                    timer_del(i->tx_timer);
++                }
++            }
++            val = 0;
++            break;
++        case 0x00:                                  /* IN_CONF0 */
++        case 0x80:                                  /* OUT_CONF0 */
++            val &= ~1u;                             /* reset: done */
++            break;
++        }
++    }
++    s->ahbdma_regs[addr / 4] = val;
++}
++
++static const MemoryRegionOps ahbdma_ops = {
++    .read = ahbdma_read,
++    .write = ahbdma_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
+ 
+ /*
+  * Blocks modelled as plain registers (what's written reads back): the
+@@ -1790,6 +2138,29 @@ static void esp32s31_machine_init(MachineState *machine)
+     memory_region_init_io(&s->zerodet_mr, NULL, &zerodet_ops, s,
+                           "esp32s31.zero_det", S31_ZERODET_SIZE);
+     memory_region_add_subregion(sysmem, S31_ZERODET_BASE, &s->zerodet_mr);
++    for (int k = 0; k < 2; k++) {
++        S31I2s *i = &s->i2s[k];
++        g_autofree char *name = g_strdup_printf("esp32s31.i2s%d", k);
++
++        i->s = s;
++        i->unit = k;
++        i->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, i2s_tx_tick, i);
++        i->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, i2s_rx_tick, i);
++        memory_region_init_io(&i->mr, NULL, &i2s_ops, i, name, S31_I2S_SIZE);
++        memory_region_add_subregion(sysmem, S31_I2S0_BASE + k * 0x1000,
++                                    &i->mr);
++    }
++    memory_region_init_io(&s->i2sclk_mr, NULL, &i2sclk_ops, s,
++                          "esp32s31.i2s-clocks", S31_I2SCLK_SIZE);
++    memory_region_add_subregion_overlap(sysmem, S31_I2SCLK_BASE,
++                                        &s->i2sclk_mr, 1);
++    for (int p = 0; p < 5; p++) {
++        s->ahbdma_regs[AHB_IN_PERI_SEL(p) / 4] = 63;
++        s->ahbdma_regs[AHB_OUT_PERI_SEL(p) / 4] = 63;
++    }
++    memory_region_init_io(&s->ahbdma_mr, NULL, &ahbdma_ops, s,
++                          "esp32s31.ahb-gdma", S31_AHBDMA_SIZE);
++    memory_region_add_subregion(sysmem, S31_AHBDMA_BASE, &s->ahbdma_mr);
+     s->canbus = CAN_BUS(object_new(TYPE_CAN_BUS));
+     object_property_add_child(OBJECT(machine), "canbus", OBJECT(s->canbus));
+     object_unref(OBJECT(s->canbus));
+-- 
+2.43.0
+

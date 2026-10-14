@@ -1,7 +1,7 @@
 From 7e303dea31540e417d97b056b50d21db1c5f3eb2 Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Tue, 13 Oct 2026 23:54:47 -0400
-Subject: [PATCH 03/15] hw/riscv/esp32s31: add the Ethernet MAC
+Subject: [PATCH 03/16] hw/riscv/esp32s31: add the Ethernet MAC
 
 Model the ESP32-S31's DesignWare GMAC with the existing NPCM GMAC model
 (DWC GMAC 3.x with normal descriptors) at 0x20350000, wired to interrupt

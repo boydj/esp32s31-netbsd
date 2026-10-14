@@ -1,7 +1,7 @@
 From 9010b7e57ee1d703a28a098a2fd63636c7df2949 Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 15:15:07 -0400
-Subject: [PATCH 12/15] hw/riscv/esp32s31: UART1-3, timer groups, RTC timer,
+Subject: [PATCH 12/16] hw/riscv/esp32s31: UART1-3, timer groups, RTC timer,
  LP_SYS, IO_MUX
 
 UART1-3 (serial ports 3-5) with the S31 register layout and loopback;
