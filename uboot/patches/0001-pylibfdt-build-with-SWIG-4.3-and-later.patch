@@ -1,0 +1,63 @@
+From 7fdd0c144ce2abdd592f5724b0f9fb76c76ddf19 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Tue, 13 Oct 2026 22:13:53 -0400
+Subject: [PATCH] scripts/dtc/pylibfdt: build with SWIG 4.3 and later
+
+SWIG 4.3 added a third argument to SWIG_Python_AppendOutput() and
+dropped its Python 2 compatibility macros (PyInt_AsLong,
+PyString_FromString), so the pylibfdt typemaps no longer compile.  Use
+SWIG_AppendOutput() and the Python 3 API instead, as upstream dtc does.
+These work with older SWIG versions too.
+
+This only affects the host-side Python binding used by binman; the
+firmware images are unchanged.
+---
+ scripts/dtc/pylibfdt/libfdt.i_shipped | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/scripts/dtc/pylibfdt/libfdt.i_shipped b/scripts/dtc/pylibfdt/libfdt.i_shipped
+index 56cc5d48..c738d805 100644
+--- a/scripts/dtc/pylibfdt/libfdt.i_shipped
++++ b/scripts/dtc/pylibfdt/libfdt.i_shipped
+@@ -1033,11 +1033,11 @@ typedef uint32_t fdt32_t;
+ 	PyObject *buff;
+ 
+ 	if ($1) {
+-		resultobj = PyString_FromString(
++		resultobj = PyUnicode_FromString(
+ 			fdt_string(fdt1, fdt32_to_cpu($1->nameoff)));
+ 		buff = PyByteArray_FromStringAndSize(
+ 			(const char *)($1 + 1), fdt32_to_cpu($1->len));
+-		resultobj = SWIG_Python_AppendOutput(resultobj, buff);
++		resultobj = SWIG_AppendOutput(resultobj, buff);
+ 	}
+ }
+ 
+@@ -1070,13 +1070,13 @@ typedef uint32_t fdt32_t;
+ 
+ /* typemaps used for fdt_next_node() */
+ %typemap(in, numinputs=1) int *depth (int depth) {
+-   depth = (int) PyInt_AsLong($input);
++   depth = (int) PyLong_AsLong($input);
+    $1 = &depth;
+ }
+ 
+ %typemap(argout) int *depth {
+         PyObject *val = Py_BuildValue("i", *arg$argnum);
+-        resultobj = SWIG_Python_AppendOutput(resultobj, val);
++        resultobj = SWIG_AppendOutput(resultobj, val);
+ }
+ 
+ %apply int *depth { int *depth };
+@@ -1092,7 +1092,7 @@ typedef uint32_t fdt32_t;
+            if (PyTuple_GET_SIZE(resultobj) == 0)
+               resultobj = val;
+            else
+-              resultobj = SWIG_Python_AppendOutput(resultobj, val);
++              resultobj = SWIG_AppendOutput(resultobj, val);
+         }
+ }
+ 
+-- 
+2.43.0
+

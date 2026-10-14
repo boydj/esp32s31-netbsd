@@ -110,13 +110,14 @@ glib and pixman.  If gitlab.com is unreachable, set
 `QEMU_WRAP_MIRROR=github` for QEMU's subprojects.
 
 On **macOS** (Homebrew), the system `make` is GNU make 3.81, too old for
-U-Boot.  The scripts pick up Homebrew's `gmake` and its keg-only bison,
-flex and OpenSSL automatically:
+U-Boot, and the system `python3` (3.9) is too old for esptool 5, which is
+the first with ESP32-S31 support.  The scripts pick up Homebrew's `gmake`
+and its keg-only bison, flex and OpenSSL automatically:
 
 ```sh
-brew install make bison flex swig openssl@3 pkgconf ninja glib pixman
-python3 -m venv .venv && . .venv/bin/activate
-pip install setuptools pyelftools esptool pexpect
+brew install make bison flex swig openssl@3 pkgconf ninja glib pixman python
+$(brew --prefix)/bin/python3 -m venv --clear .venv && . .venv/bin/activate
+pip install setuptools pyelftools 'esptool>=5' pexpect
 ./build-all.sh
 ```
 
@@ -165,8 +166,10 @@ independent check of the boot path and the flash image format.
   pluggable timer/`delay(9)`, a `.bss` clearing fix in locore.  To check
   they don't regress riscv64, `GENERIC64` was built and booted on QEMU's
   `virt` machine (2 harts) up to the root device prompt.
-* **Firmware**: Espressif's OpenSBI and U-Boot, unmodified, built with
-  the NetBSD toolchain (`tools/build-firmware.sh`).
+* **Firmware**: Espressif's OpenSBI and U-Boot, built with the NetBSD
+  toolchain (`tools/build-firmware.sh`).  The firmware code is unmodified.
+  `uboot/patches` only fixes U-Boot's host-side Python libfdt binding for
+  SWIG 4.3 and later.
 
 ## Caveats for the first run on silicon
 

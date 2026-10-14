@@ -11,8 +11,8 @@
 # Host requirements: GNU make >= 4, bison, flex, swig, OpenSSL headers,
 # python3 with setuptools and pyelftools (U-Boot's binman builds its own
 # libfdt Python module).  On macOS (Homebrew):
-#   brew install make bison flex swig openssl@3 pkgconf
-#   python3 -m venv .venv && . .venv/bin/activate &&
+#   brew install make bison flex swig openssl@3 pkgconf python
+#   $(brew --prefix)/bin/python3 -m venv .venv && . .venv/bin/activate &&
 #       pip install setuptools pyelftools esptool pexpect
 #
 set -eu
@@ -83,6 +83,12 @@ done
 cp "$GI/stdint-gcc.h" "$GI/stdint.h"
 
 echo "=== U-Boot"
+# Host-side build fixes (uboot/patches), applied once.
+for p in "$REPO"/uboot/patches/*.patch; do
+	[ -f "$p" ] || continue
+	git -C "$W/uboot-esp" apply --reverse --check "$p" 2>/dev/null ||
+	    git -C "$W/uboot-esp" apply "$p"
+done
 $GMAKE -C "$W/uboot-esp" O="$W/build-uboot" CROSS_COMPILE=$CROSS \
     espressif_esp32s31_defconfig >/dev/null
 $GMAKE -C "$W/uboot-esp" -j"$J" O="$W/build-uboot" CROSS_COMPILE=$CROSS \

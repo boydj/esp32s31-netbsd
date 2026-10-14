@@ -16,8 +16,12 @@ SPL=$1 ITB=$2 DTB=$3 IMG=$4 OUT=$5
 TOOLDIR=${TOOLDIR:?set TOOLDIR to the NetBSD tool directory}
 CROSS=${CROSS:-$TOOLDIR/bin/riscv32--netbsd-}
 ESPTOOL=${ESPTOOL:-esptool}
-command -v "$ESPTOOL" >/dev/null 2>&1 ||
-	{ echo "mkflash.sh: esptool 5.x not found (pip install esptool)" >&2; exit 1; }
+# Needs an esptool that knows the ESP32-S31 (5.x, which needs Python 3.10+).
+if ! "$ESPTOOL" --chip esp32s31 elf2image --help >/dev/null 2>&1; then
+	echo "mkflash.sh: $ESPTOOL missing or without ESP32-S31 support;" \
+	    "install esptool 5.x (pip install 'esptool>=5', Python 3.10+)" >&2
+	exit 1
+fi
 SPL_SRAM_ADDR=0x2F040000
 # DIO/80m is mandatory: elf2image's QIO/40m default makes the ROM read
 # garbage before the SPL's own QIO bring-up.
