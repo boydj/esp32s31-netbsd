@@ -41,6 +41,10 @@ What works:
 * Gigabit Ethernet (DesignWare GMAC, RGMII): clocks, resets, pin
   muxing, the PHY reset GPIO and the factory MAC address from eFuse, with
   `dhcpcd` at boot and `ping`, `ftp` (HTTP), `nc`, `route`, `arp`;
+* USB 2.0 host (DesignWare HS OTG with its UTMI PHY): USB sticks
+  (`mount -t msdos /dev/sd0e /mnt`), USB serial adapters (`cu -l
+  /dev/dtyU0 -s 115200`), USB Ethernet adapters (configured by `dhcpcd`
+  when plugged in), and hubs;
 * GPIO through `gpioctl(8)`.
 
 The root file system has `sh`, `vi`, `awk`, `sed`, `grep`, `less`, `ps`,
@@ -48,8 +52,8 @@ The root file system has `sh`, `vi`, `awk`, `sed`, `grep`, `less`, `ps`,
 tmpfs.
 
 Not supported yet: the second hart (SMP), Wi-Fi/BLE (no public
-programming information), SD/MMC, writing to the flash, USB, the USB
-Serial/JTAG console, and an RTC.
+programming information), SD/MMC, writing to the flash, USB device
+(gadget) mode, the USB Serial/JTAG console, and an RTC.
 
 ```
 ESP-ROM:esp32s31-20251218
@@ -144,7 +148,7 @@ takes a few minutes.
 
 ```sh
 # QEMU model
-test/boot-test.py --reboots 2 --vi --fptest --net
+test/boot-test.py --reboots 2 --vi --fptest --net --usb
 test/boot-test.py --machopts ",asid=off"     # a core without ASIDs
 test/rx-flood.py                             # UART RX stress
 
@@ -154,8 +158,9 @@ test/boot-test.py --esp-emu ~/.local/bin/esp-emu --reboots 1 --vi --fptest --net
 
 `boot-test.py` boots the image, logs in, runs commands (pass your own as
 arguments), optionally runs the FPU test, checks DHCP and ping over the
-emulated Ethernet, edits a file with `vi` over the console and
-warm-reboots, then halts.  To play with it interactively:
+emulated Ethernet, plugs in a USB stick, a USB Ethernet adapter and an
+FTDI serial adapter (QEMU only), edits a file with `vi` over the console
+and warm-reboots, then halts.  To play with it interactively:
 
 ```sh
 work/qemu/build/qemu-system-riscv32 -M esp32s31,flash=work/out/s31_netbsd_flash.bin \
@@ -166,8 +171,11 @@ esp-emu --chip esp32s31 --firmware work/out/s31_netbsd_flash.bin --net user
 The QEMU machine (`qemu/patches`) models the parts NetBSD and the boot
 firmware use: CLIC-mode harts (stvec alignment, SPIL in scause, no
 sie/sip), the CLIC, interrupt matrix, SYSTIMER, UART0, TRNG, the reset
-register, the flash XIP window and the Ethernet MAC (QEMU's NPCM GMAC
-model, which is the same DesignWare core with normal descriptors).  It emulates the SPL step itself: it
+register, the flash XIP window, the Ethernet MAC (QEMU's NPCM GMAC
+model, which is the same DesignWare core with normal descriptors) and the
+USB OTG controller (QEMU's dwc2 host model, as on the Raspberry Pi).
+esp-emulator has no USB OTG model; there `dwctwo0` fails to reset the
+core and the rest of the system carries on.  It emulates the SPL step itself: it
 parses `u-boot.itb` and starts OpenSBI the way the SPL would.  esp-emulator
 runs the real mask ROM and SPL instead.  That makes it the more
 independent check of the boot path and the flash image format.
@@ -177,7 +185,8 @@ independent check of the boot path and the flash image format.
 * **Kernel**: `sys/arch/riscv/espressif` in the NetBSD branch.  CLIC
   (`espclic`, `espintmtx`), SYSTIMER (`espsystimer`), UART (`espuart`),
   TRNG (`esptrng`), clocks and resets (`espclkrst`), GPIO and pin muxing
-  (`espgpio`), the Ethernet glue for `awge` (`esp_gmac.c`), the flash root
+  (`espgpio`), the Ethernet glue for `awge` (`esp_gmac.c`), the USB PHY
+  (`espusbphy`; the controller is the stock `dwctwo`), the flash root
   file system (`espxiproot`), the FDT platform code, and
   `loader/loader.S`.  The
   loader turns the kernel into a RISC-V `Image` that U-Boot can `booti`
@@ -205,6 +214,9 @@ source code, not against hardware:
   writes back and invalidates PSRAM lines around every transfer.
 * **Ethernet.**  The pin mux, RGMII clocking and PHY reset follow
   Espressif's Linux device tree for the devkit (Motorcomm YT8531 PHY).
+* **USB.**  The PHY power-up sequence and the controller parameters
+  follow Espressif's Linux drivers; VBUS on the host port is whatever the
+  board provides.
 * **PMA/APM.**  These are left as OpenSBI and U-Boot configure them.
 * **TRNG.**  Entropy is credited at 1 bit per byte, after health tests.
 * **Console.**  The UART divisor is left as the ROM and U-Boot set it

@@ -1,0 +1,82 @@
+From 12eb39d0a774423736494940a195ae84e1c14dec Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 00:13:56 -0400
+Subject: [PATCH 5/5] hw/riscv/esp32s31: add the USB OTG-HS controller
+
+Model the ESP32-S31's DesignWare HS OTG controller with QEMU's dwc2 host
+model at 0x20300000, wired to interrupt matrix source 99, with DMA to
+the system bus.  The PHY's registers stay unimplemented.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/riscv/Kconfig    |  1 +
+ hw/riscv/esp32s31.c | 19 +++++++++++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+index 00cd2e2..3b0000f 100644
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -76,6 +76,7 @@ config ESP32S31
+     select RISCV_ACLINT
+     select UNIMP
+     select NPCM_GMAC
++    select USB_DWC2
+ 
+ config SHAKTI_C
+     bool
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index 7f342c2..38700f2 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -39,6 +39,7 @@
+ #include "hw/core/irq.h"
+ #include "hw/core/sysbus.h"
+ #include "hw/net/npcm_gmac.h"
++#include "hw/usb/hcd-dwc2.h"
+ #include "net/net.h"
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+@@ -73,6 +74,7 @@ enum {
+     S31_SYSTIMER_BASE   = 0x20399000, S31_SYSTIMER_SIZE = 0x100,
+     S31_TRNG_BASE       = 0x20814000, S31_TRNG_SIZE   = 0x100,
+     S31_EMAC_BASE       = 0x20350000,
++    S31_USB_BASE        = 0x20300000,
+     S31_INTMTX_BASE     = 0x20585000, S31_INTMTX_SIZE = 0x800,
+     S31_LPAON_BASE      = 0x20701000, S31_LPAON_SIZE  = 0x1000,
+     S31_MTIMER_BASE     = 0x3f000000, /* not on the chip; backs the time CSR */
+@@ -84,6 +86,7 @@ enum {
+ #define S31_SRC_UART0       9
+ #define S31_SRC_SYSTIMER0   33
+ #define S31_SRC_EMAC        98
++#define S31_SRC_USB_OTGHS   99
+ 
+ #define CLIC_NIDS           64
+ #define INTMTX_NSRC         128
+@@ -935,6 +938,22 @@ static void esp32s31_machine_init(MachineState *machine)
+                                              S31_SRC_EMAC));
+     }
+ 
++    /*
++     * USB 2.0 OTG-HS: a DesignWare HS OTG controller, which QEMU models
++     * in host mode for the Raspberry Pi.  Its DMA sees the system bus.
++     */
++    {
++        DeviceState *usb = qdev_new(TYPE_DWC2_USB);
++
++        object_property_add_const_link(OBJECT(usb), "dma-mr",
++                                       OBJECT(sysmem));
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(usb), &error_fatal);
++        sysbus_mmio_map(SYS_BUS_DEVICE(usb), 0, S31_USB_BASE);
++        sysbus_connect_irq(SYS_BUS_DEVICE(usb), 0,
++                           qemu_allocate_irq(esp32s31_source_irq, s,
++                                             S31_SRC_USB_OTGHS));
++    }
++
+     s->st_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, systimer_timer_cb, s);
+ 
+     qemu_chr_fe_init(&s->chr, serial_hd(0), &error_fatal);
+-- 
+2.43.0
+

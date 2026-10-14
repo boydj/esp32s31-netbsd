@@ -1,0 +1,48 @@
+From feb41f0e87617c0625a4fb2e65656fa2cdd77c5e Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 00:13:56 -0400
+Subject: [PATCH 4/5] hw/usb/dev-serial: accept FTDI SET_BITMODE resets
+
+NetBSD's uftdi driver resets the bit mode before every parameter change
+and fails with EIO when the request stalls.  Bit-bang modes aren't
+modelled; accept a request that selects the plain UART mode (mode 0)
+and keep stalling the others.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/usb/dev-serial.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/hw/usb/dev-serial.c b/hw/usb/dev-serial.c
+index b238cb7..978c94e 100644
+--- a/hw/usb/dev-serial.c
++++ b/hw/usb/dev-serial.c
+@@ -37,6 +37,7 @@
+ #define FTDI_SET_ERROR_CHR     7
+ #define FTDI_SET_LATENCY       9
+ #define FTDI_GET_LATENCY       10
++#define FTDI_SET_BITMODE       11
+ 
+ /* RESET */
+ 
+@@ -412,6 +413,16 @@ static void usb_serial_handle_control(USBDevice *dev, USBPacket *p,
+         data[0] = s->latency;
+         p->actual_length = 1;
+         break;
++    case VendorDeviceOutRequest | FTDI_SET_BITMODE:
++        /*
++         * Bit-bang modes aren't modelled; accept the request so that
++         * drivers which reset the bit mode before use (NetBSD's uftdi)
++         * see a plain UART.
++         */
++        if (value >> 8) {
++            goto fail;
++        }
++        break;
+     default:
+     fail:
+         trace_usb_serial_unsupported_control(bus->busnr, dev->addr, request,
+-- 
+2.43.0
+

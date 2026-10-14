@@ -4,11 +4,13 @@ Boot the ESP32-S31 flash image in QEMU's esp32s31 machine, log in on the
 serial console and run a few commands.
 
 usage: boot-test.py [--qemu PATH | --esp-emu PATH] [--flash FILE]
-                    [--reboots N] [--vi] [--net] [--fptest] [cmd ...]
+                    [--reboots N] [--vi] [--net] [--fptest] [--usb]
+                    [cmd ...]
 """
 import argparse
 import os
 import sys
+import tempfile
 import time
 
 import pexpect
@@ -33,6 +35,9 @@ ap.add_argument("--net", action="store_true",
                      "(QEMU needs libslirp)")
 ap.add_argument("--fptest", action="store_true",
                 help="run the FPU context-switch test")
+ap.add_argument("--usb", action="store_true",
+                help="QEMU only: plug in a USB stick, a USB Ethernet adapter "
+                     "and an FTDI serial adapter, and check all three")
 ap.add_argument("cmds", nargs="*")
 a = ap.parse_args()
 
@@ -57,6 +62,21 @@ else:
             "-nographic", "-serial", "mon:stdio", "-monitor", "none"]
     if a.net:
         argv += ["-nic", "user"]
+    if a.usb:
+        # A FAT "stick" made by QEMU from a directory, an Ethernet adapter
+        # on its own user-mode network, and an FTDI serial adapter.
+        usbdir = tempfile.mkdtemp(prefix="s31usb.")
+        stick = os.path.join(usbdir, "stick")
+        os.mkdir(stick)
+        with open(os.path.join(stick, "hello.txt"), "w") as f:
+            f.write("hello from a USB stick\n")
+        serout = os.path.join(usbdir, "ftdi.out")
+        argv += ["-drive", f"if=none,id=stick,format=raw,file=fat:rw:{stick}",
+                 "-device", "usb-storage,drive=stick",
+                 "-netdev", "user,id=usbnet,net=10.0.3.0/24",
+                 "-device", "usb-net,netdev=usbnet",
+                 "-chardev", f"file,id=ftdi,path={serout}",
+                 "-device", "usb-serial,chardev=ftdi"]
 child = pexpect.spawn(argv[0], argv[1:], timeout=a.timeout)
 child.logfile_read = log
 
@@ -87,6 +107,19 @@ if a.net:
           " [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done;"
           " netstat -rn -f inet | grep ^default", "default", 180)
     check("ping", "ping -c 3 -w 10 10.0.2.2", "packet loss")
+if a.usb:
+    check("usb stick", "mount -t msdos /dev/sd0e /mnt && cat /mnt/hello.txt;"
+          " umount /mnt", "hello from a USB stick")
+    check("usb ethernet", "i=0; while ! netstat -rn -f inet |"
+          " grep -q '^default.*cdce0' &&"
+          " [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done;"
+          " ping -c 3 -w 10 10.0.3.2", " 0.0% packet loss", 180)
+    child.sendline("(stty clocal; echo hello over ftdi; sleep 1)"
+                   " < /dev/dtyU0 > /dev/dtyU0")
+    child.expect("esp32s31# ")
+    with open(serout) as f:
+        ok = "hello over ftdi" in f.read()
+    print(f"usb serial: {'ok' if ok else 'FAILED'}", flush=True)
 if a.vi:
     # full-screen editor over the serial console
     child.sendline("TERM=vt100 vi /tmp/vi-test")
