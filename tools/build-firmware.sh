@@ -1,7 +1,9 @@
 #!/bin/sh
 #
 # build-firmware.sh: build Espressif's ESP32-S31 boot firmware (OpenSBI and
-# U-Boot, unmodified) with the NetBSD cross toolchain.
+# U-Boot) with the NetBSD cross toolchain.  OpenSBI gets the vendor calls
+# that start the Wi-Fi/Bluetooth co-processor firmware on hart 1
+# (opensbi/patches); U-Boot only host-side build fixes (uboot/patches).
 #
 # Outputs:
 #   $W/build-opensbi/platform/generic/firmware/fw_dynamic.bin
@@ -67,6 +69,11 @@ PATH=$TOOLS/bin:$PATH
 export PATH
 
 echo "=== OpenSBI"
+for p in "$REPO"/opensbi/patches/*.patch; do
+	[ -f "$p" ] || continue
+	git -C "$W/opensbi-esp" apply --reverse --check "$p" 2>/dev/null ||
+	    git -C "$W/opensbi-esp" apply "$p"
+done
 $GMAKE -C "$W/opensbi-esp" -j"$J" PLATFORM=generic \
     PLATFORM_DEFCONFIG=esp32s31_defconfig PLATFORM_RISCV_XLEN=32 \
     CROSS_COMPILE=$CROSS O="$W/build-opensbi" >/dev/null

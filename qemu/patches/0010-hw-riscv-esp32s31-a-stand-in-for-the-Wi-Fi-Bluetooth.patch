@@ -1,0 +1,968 @@
+From 2d4a74db0bb06e75911b66343be3793355fdd7db Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 09:28:51 -0400
+Subject: [PATCH 10/10] hw/riscv/esp32s31: a stand-in for the Wi-Fi/Bluetooth
+ co-processor
+
+NetBSD runs Espressif's Wi-Fi and Bluetooth firmware on the second hart
+and talks to it through message rings in PSRAM, with FROM_CPU interrupts
+as doorbells.  QEMU has neither the Wi-Fi MAC nor the Bluetooth
+controller, so when hart 1 leaves reset, a model plays the firmware's side
+of the protocol: an access point whose frames go to '-nic ...,model=espwifi'
+and an HCI transport to a chardev (e.g. Google Bumble's controller).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/misc/Kconfig                   |   3 +
+ hw/misc/esp32s31_coproc.c         | 773 ++++++++++++++++++++++++++++++
+ hw/misc/meson.build               |   1 +
+ hw/riscv/Kconfig                  |   1 +
+ hw/riscv/esp32s31.c               |  24 +
+ include/hw/misc/esp32s31_coproc.h |  59 +++
+ 6 files changed, 861 insertions(+)
+ create mode 100644 hw/misc/esp32s31_coproc.c
+ create mode 100644 include/hw/misc/esp32s31_coproc.h
+
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index 1543ee6..e646510 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -258,3 +258,6 @@ config XLNX_ZYNQ_DDRC
+     bool
+ 
+ source macio/Kconfig
++
++config ESP32S31_COPROC
++    bool
+diff --git a/hw/misc/esp32s31_coproc.c b/hw/misc/esp32s31_coproc.c
+new file mode 100644
+index 0000000..3f36a44
+--- /dev/null
++++ b/hw/misc/esp32s31_coproc.c
+@@ -0,0 +1,773 @@
++/*
++ * ESP32-S31 radio co-processor: a stand-in for the Wi-Fi/Bluetooth
++ * firmware that runs on hart 1.
++ *
++ * On the chip, the OS on hart 0 loads an ESP-IDF build from flash and
++ * starts hart 1 on it (through OpenSBI); the two talk through message rings
++ * in PSRAM, with FROM_CPU interrupts as doorbells (NetBSD's
++ * sys/arch/riscv/espressif/esp_cpproto.h).  QEMU has neither the second
++ * hart's Wi-Fi MAC nor its Bluetooth controller, so this model plays the
++ * firmware's part of the protocol instead, from the moment hart 1 is let
++ * out of reset:
++ *
++ *  - Wi-Fi: one access point ("ssid", "password" properties) whose frames
++ *    go to a QEMU network backend: -nic user,model=espwifi.
++ *  - Bluetooth: HCI packets, H4-framed, to and from a character device
++ *    ("chardev"), e.g. Google Bumble's virtual controller over TCP:
++ *    -chardev socket,id=bt,host=localhost,port=9544
++ *    -global esp32s31-coproc.chardev=bt
++ *
++ * Registers: HP_SYSTEM CPU_INT_FROM_CPU_0..3 (region 0) and
++ * HP_SYS_CLKRST HPCORE1_CTRL0 (region 1, hart 1's reset).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/main-loop.h"
++#include "qemu/timer.h"
++#include "qemu/cutils.h"
++#include "qapi/error.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/core/sysbus.h"
++#include "hw/misc/esp32s31_coproc.h"
++#include "system/address-spaces.h"
++#include "system/dma.h"
++#include "net/net.h"
++#include "net/eth.h"
++
++/* esp_cpproto.h, the parts used here */
++#define FW_MAGIC        0x43313353u
++#define FW_PARAMS_OFF   20          /* eh_params */
++#define BP_MAGIC        0x50423343u
++#define SHM_MAGIC       0x4d485343u
++#define PROTO_VERSION   1
++
++#define SHM_STATE       8
++#define SHM_HEARTBEAT   12
++#define SHM_CAPS        16
++#define SHM_WIFI_MAC    20
++#define SHM_BT_ADDR     26
++#define SHM_IDENT       32
++#define SHM_H2F         (32 + 64 + 4 * 16)
++#define SHM_F2H         (SHM_H2F + 32)
++#define SHM_LOG         (SHM_F2H + 32)
++
++#define RING_HEAD       0
++#define RING_TAIL       4
++#define RING_OFFSET     8
++#define RING_SIZE       12
++#define RING_WAIT       16
++
++#define CHAN_CTL        1
++#define CHAN_WIFI       2
++#define CHAN_HCI        3
++#define CHAN_PAD        0xff
++#define MSG_MAX         2048
++
++#define CTL_PING        1
++#define CTL_WIFI_START  2
++#define CTL_WIFI_STOP   3
++#define CTL_WIFI_SCAN   4
++#define CTL_WIFI_CONNECT 5
++#define CTL_WIFI_DISCONNECT 6
++#define CTL_WIFI_STATUS 7
++#define CTL_BT_ENABLE   8
++#define CTL_BT_DISABLE  9
++#define EVT_WIFI_LINK   64
++
++#define WIFI_OFF        0
++#define WIFI_IDLE       1
++#define WIFI_CONNECTING 2
++#define WIFI_CONNECTED  3
++
++#define AUTH_OPEN       0
++#define AUTH_WPA2_PSK   3
++
++#define E_OPNOTSUPP     45
++#define E_NETDOWN       50
++
++#define DOORBELL_FW     1
++#define DOORBELL_HOST   2
++
++#define HPCORE1_CPU_CLK_EN      (1u << 1)
++#define HPCORE1_GLOBAL_RST_EN   (1u << 2)
++
++static const uint8_t ap_bssid[6] = { 0x02, 0x00, 0x00, 0x5a, 0x31, 0x01 };
++
++static uint32_t ld32(const uint8_t *p)
++{
++    return ldl_le_p(p);
++}
++
++static void mem_read(hwaddr addr, void *buf, hwaddr len)
++{
++    address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
++                       buf, len);
++}
++
++static void mem_write(hwaddr addr, const void *buf, hwaddr len)
++{
++    address_space_write(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
++                        buf, len);
++}
++
++static uint32_t mem_ld32(hwaddr addr)
++{
++    uint8_t b[4];
++
++    mem_read(addr, b, 4);
++    return ld32(b);
++}
++
++static void mem_st32(hwaddr addr, uint32_t v)
++{
++    uint8_t b[4];
++
++    stl_le_p(b, v);
++    mem_write(addr, b, 4);
++}
++
++static void coproc_update_irq(Esp32s31CoprocState *s)
++{
++    qemu_set_irq(s->irq, s->from_cpu[DOORBELL_HOST] & 1);
++}
++
++static void doorbell_host(Esp32s31CoprocState *s)
++{
++    s->from_cpu[DOORBELL_HOST] = 1;
++    coproc_update_irq(s);
++}
++
++/* ------------------------------------------------------------------------
++ * Rings
++ */
++
++static hwaddr ring_addr(Esp32s31CoprocState *s, unsigned ring)
++{
++    return s->shm + ring;
++}
++
++static uint32_t ring_room(Esp32s31CoprocState *s, unsigned ring, size_t len)
++{
++    const hwaddr r = ring_addr(s, ring);
++    const uint32_t head = mem_ld32(r + RING_HEAD);
++    const uint32_t tail = mem_ld32(r + RING_TAIL);
++    const uint32_t size = mem_ld32(r + RING_SIZE);
++    const uint32_t need = (4 + len + 3) & ~3u;
++    const uint32_t contig = size - (head & (size - 1));
++    const uint32_t total = contig < need ? contig + need : need;
++
++    return size - (head - tail) >= total;
++}
++
++static bool ring_put(Esp32s31CoprocState *s, uint8_t chan, uint8_t type,
++                     const void *a, size_t alen, const void *b, size_t blen)
++{
++    const hwaddr r = ring_addr(s, SHM_F2H);
++    const size_t len = alen + blen;
++    const uint32_t need = (4 + len + 3) & ~3u;
++    const uint32_t size = mem_ld32(r + RING_SIZE);
++    const hwaddr base = s->shm + mem_ld32(r + RING_OFFSET);
++    uint32_t head = mem_ld32(r + RING_HEAD);
++    uint32_t off = head & (size - 1);
++    uint8_t hdr[4];
++
++    if (len > MSG_MAX || !ring_room(s, SHM_F2H, len)) {
++        return false;
++    }
++    if (size - off < need) {
++        stw_le_p(hdr, 0);
++        hdr[2] = CHAN_PAD;
++        hdr[3] = 0;
++        mem_write(base + off, hdr, 4);
++        head += size - off;
++        off = 0;
++    }
++    stw_le_p(hdr, len);
++    hdr[2] = chan;
++    hdr[3] = type;
++    mem_write(base + off, hdr, 4);
++    if (alen) {
++        mem_write(base + off + 4, a, alen);
++    }
++    if (blen) {
++        mem_write(base + off + 4 + alen, b, blen);
++    }
++    mem_st32(r + RING_HEAD, head + need);
++    doorbell_host(s);
++    return true;
++}
++
++static void log_put(Esp32s31CoprocState *s, const char *text)
++{
++    const hwaddr r = ring_addr(s, SHM_LOG);
++    const uint32_t size = mem_ld32(r + RING_SIZE);
++    const hwaddr base = s->shm + mem_ld32(r + RING_OFFSET);
++    uint32_t head = mem_ld32(r + RING_HEAD);
++
++    for (; *text != '\0'; text++, head++) {
++        if (head - mem_ld32(r + RING_TAIL) >= size) {
++            break;
++        }
++        mem_write(base + (head & (size - 1)), text, 1);
++    }
++    mem_st32(r + RING_HEAD, head);
++}
++
++static void ctl_reply(Esp32s31CoprocState *s, uint8_t type, uint32_t seq,
++                      int32_t status, const void *data, size_t len)
++{
++    uint8_t c[8];
++
++    stl_le_p(c, seq);
++    stl_le_p(c + 4, status);
++    if (!ring_put(s, CHAN_CTL, type, c, sizeof(c), data, len)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "esp32s31-coproc: reply lost\n");
++    }
++}
++
++/* ------------------------------------------------------------------------
++ * Wi-Fi
++ */
++
++static size_t wifi_status(Esp32s31CoprocState *s, uint8_t *ws)
++{
++    const size_t ssidlen = strnlen(s->cur_ssid, 32);
++
++    memset(ws, 0, 44);
++    ws[0] = s->wifi_state;
++    if (s->wifi_state == WIFI_CONNECTED) {
++        ws[1] = 6;                          /* channel */
++        ws[2] = (uint8_t)-42;               /* rssi */
++        ws[3] = s->password && *s->password ? AUTH_WPA2_PSK : AUTH_OPEN;
++        memcpy(ws + 4, ap_bssid, 6);
++    }
++    ws[10] = s->wifi_reason;
++    ws[11] = ssidlen;
++    memcpy(ws + 12, s->cur_ssid, ssidlen);
++    return 44;
++}
++
++static void wifi_link_event(Esp32s31CoprocState *s)
++{
++    uint8_t ws[44];
++
++    ctl_reply(s, EVT_WIFI_LINK, 0, 0, ws, wifi_status(s, ws));
++}
++
++static void wifi_assoc_cb(void *opaque)
++{
++    Esp32s31CoprocState *s = opaque;
++    const bool ok = strcmp(s->cur_ssid, s->ssid) == 0 &&
++                    strcmp(s->cur_pass, s->password ? s->password : "") == 0;
++
++    if (s->wifi_state != WIFI_CONNECTING) {
++        return;
++    }
++    if (ok) {
++        s->wifi_state = WIFI_CONNECTED;
++        s->wifi_reason = 0;
++        log_put(s, "I (0) wifi: connected (QEMU)\n");
++        if (s->nic) {
++            qemu_flush_queued_packets(qemu_get_queue(s->nic));
++        }
++    } else {
++        /* 201: no AP found; 15: 4-way handshake timeout */
++        s->wifi_reason = strcmp(s->cur_ssid, s->ssid) ? 201 : 15;
++        s->wifi_state = WIFI_CONNECTING;
++        timer_mod(s->assoc_timer,
++                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 5000);
++    }
++    wifi_link_event(s);
++}
++
++static void wifi_ctl(Esp32s31CoprocState *s, uint8_t type, uint32_t seq,
++                     const uint8_t *data, size_t len)
++{
++    uint8_t buf[4 + 44];
++
++    switch (type) {
++    case CTL_WIFI_START:
++        if (s->wifi_state == WIFI_OFF) {
++            s->wifi_state = WIFI_IDLE;
++        }
++        ctl_reply(s, type, seq, 0, NULL, 0);
++        break;
++    case CTL_WIFI_STOP:
++        timer_del(s->assoc_timer);
++        s->wifi_state = WIFI_OFF;
++        ctl_reply(s, type, seq, 0, NULL, 0);
++        break;
++    case CTL_WIFI_SCAN: {
++        const size_t n = strnlen(s->ssid, 32);
++
++        memset(buf, 0, sizeof(buf));
++        stl_le_p(buf, 1);
++        memcpy(buf + 4, ap_bssid, 6);
++        buf[4 + 6] = n;
++        buf[4 + 7] = 6;
++        buf[4 + 8] = (uint8_t)-42;
++        buf[4 + 9] = s->password && *s->password ? AUTH_WPA2_PSK : AUTH_OPEN;
++        memcpy(buf + 4 + 12, s->ssid, n);
++        if (s->wifi_state == WIFI_OFF) {
++            s->wifi_state = WIFI_IDLE;
++        }
++        ctl_reply(s, type, seq, 0, buf, sizeof(buf));
++        break;
++    }
++    case CTL_WIFI_CONNECT:
++        if (len < 33 + 65) {
++            ctl_reply(s, type, seq, 22, NULL, 0);
++            break;
++        }
++        pstrcpy(s->cur_ssid, sizeof(s->cur_ssid), (const char *)data);
++        pstrcpy(s->cur_pass, sizeof(s->cur_pass), (const char *)data + 33);
++        if (s->wifi_state == WIFI_OFF) {
++            s->wifi_state = WIFI_IDLE;
++        }
++        if (s->wifi_state == WIFI_CONNECTED) {
++            s->wifi_state = WIFI_IDLE;
++            s->wifi_reason = 8;
++            wifi_link_event(s);
++        }
++        s->wifi_state = WIFI_CONNECTING;
++        ctl_reply(s, type, seq, 0, NULL, 0);
++        timer_mod(s->assoc_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 200);
++        break;
++    case CTL_WIFI_DISCONNECT:
++        timer_del(s->assoc_timer);
++        if (s->wifi_state == WIFI_CONNECTED || s->wifi_state == WIFI_CONNECTING) {
++            s->wifi_state = WIFI_IDLE;
++            s->wifi_reason = 8;             /* assoc leave */
++            ctl_reply(s, type, seq, 0, NULL, 0);
++            wifi_link_event(s);
++        } else {
++            ctl_reply(s, type, seq, 0, NULL, 0);
++        }
++        break;
++    case CTL_WIFI_STATUS:
++        ctl_reply(s, type, seq, 0, buf, wifi_status(s, buf));
++        break;
++    }
++}
++
++static bool wifi_can_receive(NetClientState *nc)
++{
++    Esp32s31CoprocState *s = qemu_get_nic_opaque(nc);
++
++    return s->running && s->wifi_state == WIFI_CONNECTED &&
++           ring_room(s, SHM_F2H, 1600);
++}
++
++static ssize_t wifi_receive(NetClientState *nc, const uint8_t *buf,
++                            size_t size)
++{
++    Esp32s31CoprocState *s = qemu_get_nic_opaque(nc);
++
++    if (!s->running || s->wifi_state != WIFI_CONNECTED) {
++        return size;                        /* dropped */
++    }
++    if (!ring_put(s, CHAN_WIFI, 0, buf, size, NULL, 0)) {
++        return 0;                           /* queued until there's room */
++    }
++    return size;
++}
++
++static NetClientInfo wifi_info = {
++    .type = NET_CLIENT_DRIVER_NIC,
++    .size = sizeof(NICState),
++    .can_receive = wifi_can_receive,
++    .receive = wifi_receive,
++};
++
++/* ------------------------------------------------------------------------
++ * Bluetooth: H4 to and from the chardev
++ */
++
++static int bt_can_receive(void *opaque)
++{
++    Esp32s31CoprocState *s = opaque;
++
++    if (!s->running || !s->bt_enabled) {
++        return 1;                           /* discard */
++    }
++    return ring_room(s, SHM_F2H, sizeof(s->h4)) ? 1 : 0;
++}
++
++static void bt_receive(void *opaque, const uint8_t *buf, int size)
++{
++    Esp32s31CoprocState *s = opaque;
++
++    for (int i = 0; i < size; i++) {
++        if (!s->running || !s->bt_enabled) {
++            s->h4_len = 0;
++            continue;
++        }
++        if (s->h4_len >= sizeof(s->h4)) {
++            s->h4_len = 0;                  /* lost sync */
++        }
++        s->h4[s->h4_len++] = buf[i];
++        if (s->h4_len == 1) {
++            switch (s->h4[0]) {
++            case 1: s->h4_want = 1 + 3; break;      /* command */
++            case 2: s->h4_want = 1 + 4; break;      /* ACL */
++            case 3: s->h4_want = 1 + 3; break;      /* SCO */
++            case 4: s->h4_want = 1 + 2; break;      /* event */
++            default: s->h4_len = 0; break;
++            }
++            continue;
++        }
++        if (s->h4_len == s->h4_want && !s->h4_hdr_done) {
++            size_t plen;
++
++            switch (s->h4[0]) {
++            case 2: plen = lduw_le_p(s->h4 + 3); break;
++            case 4: plen = s->h4[2]; break;
++            default: plen = s->h4[3]; break;
++            }
++            s->h4_want += plen;
++            s->h4_hdr_done = true;
++        }
++        if (s->h4_hdr_done && s->h4_len == s->h4_want) {
++            if (!ring_put(s, CHAN_HCI, s->h4[0], s->h4, s->h4_len, NULL, 0)) {
++                qemu_log_mask(LOG_GUEST_ERROR,
++                              "esp32s31-coproc: HCI packet lost\n");
++            }
++            s->h4_len = 0;
++            s->h4_hdr_done = false;
++        }
++    }
++}
++
++/* ------------------------------------------------------------------------
++ * Host -> firmware ring
++ */
++
++static void ctl_input(Esp32s31CoprocState *s, uint8_t type,
++                      const uint8_t *data, size_t len)
++{
++    uint32_t seq;
++
++    if (len < 8) {
++        return;
++    }
++    seq = ld32(data);
++    data += 8;
++    len -= 8;
++    switch (type) {
++    case CTL_PING:
++        ctl_reply(s, type, seq, 0, data, len);
++        break;
++    case CTL_WIFI_START ... CTL_WIFI_STATUS:
++        if (!s->nic) {
++            ctl_reply(s, type, seq, E_NETDOWN, NULL, 0);
++        } else {
++            wifi_ctl(s, type, seq, data, len);
++        }
++        break;
++    case CTL_BT_ENABLE:
++        s->bt_enabled = true;
++        s->h4_len = 0;
++        s->h4_hdr_done = false;
++        ctl_reply(s, type, seq, 0, NULL, 0);
++        break;
++    case CTL_BT_DISABLE:
++        s->bt_enabled = false;
++        ctl_reply(s, type, seq, 0, NULL, 0);
++        break;
++    default:
++        ctl_reply(s, type, seq, E_OPNOTSUPP, NULL, 0);
++        break;
++    }
++}
++
++static void h2f_drain(void *opaque)
++{
++    Esp32s31CoprocState *s = opaque;
++    const hwaddr r = ring_addr(s, SHM_H2F);
++    uint32_t size, tail;
++    hwaddr base;
++
++    if (!s->running) {
++        return;
++    }
++    size = mem_ld32(r + RING_SIZE);
++    base = s->shm + mem_ld32(r + RING_OFFSET);
++    tail = mem_ld32(r + RING_TAIL);
++    while (tail != mem_ld32(r + RING_HEAD)) {
++        const uint32_t off = tail & (size - 1);
++        uint8_t hdr[4];
++        uint16_t len;
++
++        mem_read(base + off, hdr, 4);
++        if (hdr[2] == CHAN_PAD) {
++            tail += size - off;
++            continue;
++        }
++        len = lduw_le_p(hdr);
++        if (len > MSG_MAX || ((4 + len + 3) & ~3u) > size - off) {
++            qemu_log_mask(LOG_GUEST_ERROR, "esp32s31-coproc: bad message\n");
++            tail = mem_ld32(r + RING_HEAD);
++            break;
++        }
++        mem_read(base + off + 4, s->msg, len);
++        switch (hdr[2]) {
++        case CHAN_CTL:
++            ctl_input(s, hdr[3], s->msg, len);
++            break;
++        case CHAN_WIFI:
++            if (s->nic && s->wifi_state == WIFI_CONNECTED) {
++                qemu_send_packet(qemu_get_queue(s->nic), s->msg, len);
++            }
++            break;
++        case CHAN_HCI:
++            if (s->bt_enabled && qemu_chr_fe_backend_connected(&s->chr)) {
++                qemu_chr_fe_write_all(&s->chr, s->msg, len);
++            }
++            break;
++        }
++        tail += (4 + len + 3) & ~3u;
++        mem_st32(r + RING_TAIL, tail);
++    }
++    mem_st32(r + RING_TAIL, tail);
++    if (mem_ld32(r + RING_WAIT)) {
++        mem_st32(r + RING_WAIT, 0);
++        doorbell_host(s);
++    }
++    /* The host may have made room for us. */
++    if (s->nic) {
++        qemu_flush_queued_packets(qemu_get_queue(s->nic));
++    }
++    qemu_chr_fe_accept_input(&s->chr);
++}
++
++static void heartbeat_cb(void *opaque)
++{
++    Esp32s31CoprocState *s = opaque;
++
++    if (!s->running) {
++        return;
++    }
++    mem_st32(s->shm + SHM_HEARTBEAT, ++s->heartbeat);
++    timer_mod(s->beat_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
++}
++
++/* ------------------------------------------------------------------------
++ * Hart 1 out of reset: find the shared memory and start
++ */
++
++static void coproc_boot(void *opaque)
++{
++    Esp32s31CoprocState *s = opaque;
++    uint8_t bp[24];
++    uint32_t params;
++    uint8_t ident[64] = "espcp QEMU stand-in";
++    uint8_t mac[12];
++
++    if (mem_ld32(s->fw_base) != FW_MAGIC) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "esp32s31-coproc: no firmware header at 0x%" HWADDR_PRIx
++                      "\n", s->fw_base);
++        return;
++    }
++    params = mem_ld32(s->fw_base + FW_PARAMS_OFF);
++    mem_read(params, bp, sizeof(bp));
++    if (ld32(bp) != BP_MAGIC) {
++        qemu_log_mask(LOG_GUEST_ERROR, "esp32s31-coproc: no boot parameters\n");
++        return;
++    }
++    s->shm = ld32(bp + 12);
++    s->shmsize = ld32(bp + 16);
++    if (s->shmsize < 0x35000) {
++        qemu_log_mask(LOG_GUEST_ERROR, "esp32s31-coproc: shm too small\n");
++        return;
++    }
++
++    /* The firmware's layout (espcp_sys/start.c). */
++    mem_st32(s->shm + 4, PROTO_VERSION);
++    mem_st32(s->shm + SHM_STATE, 0);
++    mem_st32(s->shm + SHM_H2F + RING_OFFSET, 0x01000);
++    mem_st32(s->shm + SHM_H2F + RING_SIZE, 0x10000);
++    mem_st32(s->shm + SHM_F2H + RING_OFFSET, 0x11000);
++    mem_st32(s->shm + SHM_F2H + RING_SIZE, 0x20000);
++    mem_st32(s->shm + SHM_LOG + RING_OFFSET, 0x31000);
++    mem_st32(s->shm + SHM_LOG + RING_SIZE, 0x04000);
++    mem_write(s->shm + SHM_IDENT, ident, sizeof(ident));
++    memcpy(mac, s->conf.macaddr.a, 6);
++    memcpy(mac + 6, s->conf.macaddr.a, 6);
++    mac[11]++;
++    mem_write(s->shm + SHM_WIFI_MAC, mac, 12);
++    mem_st32(s->shm + SHM_CAPS, (s->nic ? 1 : 0) |
++             (qemu_chr_fe_backend_connected(&s->chr) ? 2 : 0));
++    mem_st32(s->shm, SHM_MAGIC);
++
++    s->running = true;
++    s->wifi_state = WIFI_OFF;
++    s->bt_enabled = false;
++    log_put(s, "I (0) espcp: QEMU stand-in for the radio co-processor\n");
++    mem_st32(s->shm + SHM_STATE, 1);        /* running */
++    doorbell_host(s);
++    heartbeat_cb(s);
++}
++
++static void coproc_stop(Esp32s31CoprocState *s)
++{
++    s->running = false;
++    s->wifi_state = WIFI_OFF;
++    s->bt_enabled = false;
++    timer_del(s->assoc_timer);
++    timer_del(s->beat_timer);
++}
++
++/* ------------------------------------------------------------------------
++ * Registers
++ */
++
++static uint64_t fromcpu_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31CoprocState *s = opaque;
++
++    return s->from_cpu[(addr >> 2) & 3];
++}
++
++static void fromcpu_write(void *opaque, hwaddr addr, uint64_t val,
++                          unsigned size)
++{
++    Esp32s31CoprocState *s = opaque;
++    const unsigned n = (addr >> 2) & 3;
++
++    s->from_cpu[n] = val & 1;
++    if (n == DOORBELL_HOST) {
++        coproc_update_irq(s);
++    } else if (n == DOORBELL_FW && (val & 1)) {
++        s->from_cpu[n] = 0;                 /* the "firmware" takes it */
++        qemu_bh_schedule(s->bh);
++    }
++}
++
++static const MemoryRegionOps fromcpu_ops = {
++    .read = fromcpu_read,
++    .write = fromcpu_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static uint64_t hpcore1_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31CoprocState *s = opaque;
++
++    return s->hpcore1_ctrl;
++}
++
++static void hpcore1_write(void *opaque, hwaddr addr, uint64_t val,
++                          unsigned size)
++{
++    Esp32s31CoprocState *s = opaque;
++    const bool was = (s->hpcore1_ctrl & HPCORE1_CPU_CLK_EN) &&
++                     !(s->hpcore1_ctrl & HPCORE1_GLOBAL_RST_EN);
++    const bool is = (val & HPCORE1_CPU_CLK_EN) &&
++                    !(val & HPCORE1_GLOBAL_RST_EN);
++
++    s->hpcore1_ctrl = val;
++    if (is && !was) {
++        /* Give OpenSBI time to set the boot address and return. */
++        timer_mod(s->boot_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 20);
++    } else if (!is && was) {
++        timer_del(s->boot_timer);
++        coproc_stop(s);
++    }
++}
++
++static const MemoryRegionOps hpcore1_ops = {
++    .read = hpcore1_read,
++    .write = hpcore1_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void coproc_reset(DeviceState *dev)
++{
++    Esp32s31CoprocState *s = ESP32S31_COPROC(dev);
++
++    coproc_stop(s);
++    memset(s->from_cpu, 0, sizeof(s->from_cpu));
++    s->hpcore1_ctrl = HPCORE1_GLOBAL_RST_EN;
++    coproc_update_irq(s);
++}
++
++static void coproc_realize(DeviceState *dev, Error **errp)
++{
++    Esp32s31CoprocState *s = ESP32S31_COPROC(dev);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
++
++    memory_region_init_io(&s->fromcpu_mr, OBJECT(s), &fromcpu_ops, s,
++                          "esp32s31-coproc.from-cpu", 0x10);
++    memory_region_init_io(&s->hpcore1_mr, OBJECT(s), &hpcore1_ops, s,
++                          "esp32s31-coproc.hpcore1", 4);
++    sysbus_init_mmio(sbd, &s->fromcpu_mr);
++    sysbus_init_mmio(sbd, &s->hpcore1_mr);
++    sysbus_init_irq(sbd, &s->irq);
++
++    s->bh = qemu_bh_new(h2f_drain, s);
++    s->boot_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, coproc_boot, s);
++    s->assoc_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, wifi_assoc_cb, s);
++    s->beat_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, heartbeat_cb, s);
++
++    qemu_macaddr_default_if_unset(&s->conf.macaddr);
++    if (s->conf.peers.ncs[0]) {
++        s->nic = qemu_new_nic(&wifi_info, &s->conf,
++                              object_get_typename(OBJECT(dev)), dev->id,
++                              &dev->mem_reentrancy_guard, s);
++    }
++    if (qemu_chr_fe_backend_connected(&s->chr)) {
++        qemu_chr_fe_set_handlers(&s->chr, bt_can_receive, bt_receive, NULL,
++                                 NULL, s, NULL, true);
++    }
++}
++
++static const Property coproc_properties[] = {
++    DEFINE_NIC_PROPERTIES(Esp32s31CoprocState, conf),
++    DEFINE_PROP_CHR("chardev", Esp32s31CoprocState, chr),
++    DEFINE_PROP_STRING("ssid", Esp32s31CoprocState, ssid),
++    DEFINE_PROP_STRING("password", Esp32s31CoprocState, password),
++    DEFINE_PROP_UINT64("firmware-base", Esp32s31CoprocState, fw_base,
++                       0x40c00000),
++};
++
++static void coproc_init(Object *obj)
++{
++    Esp32s31CoprocState *s = ESP32S31_COPROC(obj);
++
++    s->ssid = g_strdup("qemu-ap");
++    s->password = g_strdup("qemu-password");
++}
++
++static void coproc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->desc = "ESP32-S31 radio co-processor stand-in";
++    dc->realize = coproc_realize;
++    device_class_set_legacy_reset(dc, coproc_reset);
++    device_class_set_props(dc, coproc_properties);
++    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
++}
++
++static const TypeInfo coproc_info = {
++    .name = TYPE_ESP32S31_COPROC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(Esp32s31CoprocState),
++    .instance_init = coproc_init,
++    .class_init = coproc_class_init,
++};
++
++static void coproc_register_types(void)
++{
++    type_register_static(&coproc_info);
++}
++
++type_init(coproc_register_types)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 23265f6..c4349c5 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -168,3 +168,4 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ 
+ # HPPA devices
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
++system_ss.add(when: 'CONFIG_ESP32S31_COPROC', if_true: files('esp32s31_coproc.c'))
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+index 690e82e..6168cce 100644
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -78,6 +78,7 @@ config ESP32S31
+     select NPCM_GMAC
+     select USB_DWC2
+     select DW_MSHC
++    select ESP32S31_COPROC
+ 
+ config SHAKTI_C
+     bool
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index dd0acd9..b415481 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -13,6 +13,8 @@
+  *   0x2038A000  UART0                  (interrupt matrix source 9)
+  *   0x20399000  SYSTIMER               (source 33 = TARGET0 alarm)
+  *   0x20585000  interrupt matrix (core 0)
++ *   0x20586010  FROM_CPU interrupts, and hart 1 (0x20587020): a stand-in
++ *               for the Wi-Fi/Bluetooth co-processor firmware
+  *   0x2070103C  LP_AONCLKRST_HPCORE0_RESET_CTRL (bit 20 resets the chip)
+  *   0x40000000  NOR flash, cached XIP window (64MiB)
+  *   0x50000000  PSRAM, cached window (16MiB populated)
+@@ -54,6 +56,7 @@
+ #include "hw/riscv/boot.h"
+ #include "hw/intc/riscv_aclint.h"
+ #include "hw/misc/unimp.h"
++#include "hw/misc/esp32s31_coproc.h"
+ #include "chardev/char-fe.h"
+ #include "system/system.h"
+ #include "system/address-spaces.h"
+@@ -82,6 +85,8 @@ enum {
+     S31_SDMMC_BASE      = 0x20342000,
+     S31_GPIO_BASE       = 0x20583000, S31_GPIO_SIZE   = 0xe00,
+     S31_INTMTX_BASE     = 0x20585000, S31_INTMTX_SIZE = 0x800,
++    S31_FROM_CPU_BASE   = 0x20586010,   /* HP_SYSTEM CPU_INT_FROM_CPU_n */
++    S31_HPCORE1_CTRL0   = 0x20587020,   /* HP_SYS_CLKRST: hart 1's reset */
+     S31_LPAON_BASE      = 0x20701000, S31_LPAON_SIZE  = 0x1000,
+     S31_MTIMER_BASE     = 0x3f000000, /* not on the chip; backs the time CSR */
+     S31_FLASH_BASE      = 0x40000000, S31_FLASH_SIZE  = 64 * MiB,
+@@ -95,6 +100,7 @@ enum {
+ #define S31_SRC_SYSTIMER0   33
+ #define S31_SRC_EMAC        98
+ #define S31_SRC_USB_OTGHS   99
++#define S31_SRC_FROM_CPU2   67
+ 
+ #define CLIC_NIDS           64
+ #define INTMTX_NSRC         128
+@@ -1199,6 +1205,24 @@ static void esp32s31_machine_init(MachineState *machine)
+                                &error_fatal);
+     }
+ 
++    /*
++     * Hart 1 and its Wi-Fi/Bluetooth firmware: a stand-in that speaks the
++     * firmware's side of the message rings once hart 1 leaves reset.
++     * Wi-Fi frames go to "-nic ...,model=espwifi", Bluetooth HCI to
++     * "-global esp32s31-coproc.chardev=ID".
++     */
++    {
++        DeviceState *cp = qdev_new(TYPE_ESP32S31_COPROC);
++
++        qemu_configure_nic_device(cp, false, "espwifi");
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(cp), &error_fatal);
++        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(cp), 0, S31_FROM_CPU_BASE, 1);
++        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(cp), 1, S31_HPCORE1_CTRL0, 1);
++        sysbus_connect_irq(SYS_BUS_DEVICE(cp), 0,
++                           qemu_allocate_irq(esp32s31_source_irq, s,
++                                             S31_SRC_FROM_CPU2));
++    }
++
+     s->st_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, systimer_timer_cb, s);
+ 
+     qemu_chr_fe_init(&s->chr, serial_hd(0), &error_fatal);
+diff --git a/include/hw/misc/esp32s31_coproc.h b/include/hw/misc/esp32s31_coproc.h
+new file mode 100644
+index 0000000..18fdfae
+--- /dev/null
++++ b/include/hw/misc/esp32s31_coproc.h
+@@ -0,0 +1,59 @@
++/*
++ * ESP32-S31 radio co-processor stand-in (see hw/misc/esp32s31_coproc.c).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_MISC_ESP32S31_COPROC_H
++#define HW_MISC_ESP32S31_COPROC_H
++
++#include "hw/core/sysbus.h"
++#include "chardev/char-fe.h"
++#include "net/net.h"
++#include "qom/object.h"
++
++#define TYPE_ESP32S31_COPROC "esp32s31-coproc"
++OBJECT_DECLARE_SIMPLE_TYPE(Esp32s31CoprocState, ESP32S31_COPROC)
++
++struct Esp32s31CoprocState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion fromcpu_mr;
++    MemoryRegion hpcore1_mr;
++    qemu_irq irq;
++    QEMUBH *bh;
++    QEMUTimer *boot_timer;
++    QEMUTimer *assoc_timer;
++    QEMUTimer *beat_timer;
++
++    /* properties */
++    NICConf conf;
++    CharFrontend chr;
++    char *ssid;
++    char *password;
++    uint64_t fw_base;
++
++    NICState *nic;
++    uint32_t from_cpu[4];
++    uint32_t hpcore1_ctrl;
++
++    bool running;
++    hwaddr shm;
++    uint32_t shmsize;
++    uint32_t heartbeat;
++
++    uint8_t wifi_state;
++    uint8_t wifi_reason;
++    char cur_ssid[33];
++    char cur_pass[65];
++
++    bool bt_enabled;
++    uint8_t h4[1 + 4 + 1024];
++    size_t h4_len;
++    size_t h4_want;
++    bool h4_hdr_done;
++
++    uint8_t msg[2048];
++};
++
++#endif /* HW_MISC_ESP32S31_COPROC_H */
+-- 
+2.43.0
+

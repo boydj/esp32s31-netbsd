@@ -1,0 +1,37 @@
+menu "ESP32-S31 radio co-processor"
+
+    config ESPCP_FIRMWARE
+        bool "Build as the radio co-processor firmware for hart 1"
+        default y
+        help
+            Run as a single-core application on hart 1 next to another OS
+            (NetBSD) on hart 0: no flash driver, no chip resets, the host's
+            systimer left alone, and the image runs in place from its own
+            flash partition.
+
+    config ESPCP_SRAM_START
+        hex "First HP SRAM address the firmware may use"
+        default 0x2F030000
+        help
+            OpenSBI, which serves the OS on hart 0, sits below this.
+
+    config ESPCP_XIP_BASE
+        hex "XIP address of the firmware partition"
+        default 0x40C00000
+        help
+            The boot loader maps flash from 0x100000 at 0x40000000, so this
+            is flash offset 0xD00000.
+
+    config ESPCP_XIP_SIZE
+        hex "Size of the firmware partition"
+        default 0x300000
+
+    config ESPCP_EXTMEM_SIZE
+        hex "PSRAM requested from the host (shared memory + heap)"
+        default 0x100000
+
+    config ESPCP_SHM_SIZE
+        hex "Of which shared memory"
+        default 0x40000
+
+endmenu

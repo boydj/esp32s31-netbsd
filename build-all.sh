@@ -6,7 +6,8 @@
 #   work/qemu/build/qemu-system-riscv32    emulator with -M esp32s31
 #
 # Takes a while: the NetBSD cross toolchain alone is ~30-60 minutes.
-# Set W to use a different work directory, J for parallelism.
+# Set W to use a different work directory, J for parallelism, NO_ESPCP=1 to
+# leave out ESP-IDF and the Wi-Fi/Bluetooth firmware.
 #
 set -eu
 
@@ -16,6 +17,9 @@ export W=${W:-$REPO/work}
 "$REPO/tools/fetch-sources.sh"
 "$REPO/tools/build-netbsd.sh"
 "$REPO/tools/build-firmware.sh"
+if [ "${NO_ESPCP:-0}" != 1 ]; then
+	"$REPO/tools/build-espcp.sh"	# Wi-Fi/Bluetooth firmware for hart 1
+fi
 "$REPO/tools/assemble.sh"
 "$REPO/tools/build-qemu.sh"
 

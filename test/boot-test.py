@@ -5,12 +5,14 @@ serial console and run a few commands.
 
 usage: boot-test.py [--qemu PATH | --esp-emu PATH] [--flash FILE]
                     [--reboots N] [--vi] [--net] [--fptest] [--usb] [--gpio]
-                    [--usj] [--sd]
+                    [--usj] [--sd] [--wifi] [--bt]
                     [cmd ...]
 """
 import argparse
+import atexit
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -46,6 +48,19 @@ ap.add_argument("--sd", action="store_true",
                 help="QEMU only: format, write and read back a blank SD card")
 ap.add_argument("--gpio", action="store_true",
                 help="drive a GPIO pin with gpioctl and read it back")
+ap.add_argument("--wifi", action="store_true",
+                help="join the access point (esp-emulator's, or QEMU's "
+                     "stand-in) with espwifictl, then DHCP, ping and an HTTP "
+                     "download (serve /tmp/httproot on the host's port 8088)")
+ap.add_argument("--bt", action="store_true",
+                help="Bluetooth inquiry, SDP and RFCOMM against a Bumble "
+                     "peer (test/bt-peer.py)")
+ap.add_argument("--espcp-elf",
+                default=os.path.join(WORK, "build-espcp/espcp.elf"),
+                help="the co-processor firmware's ELF, for esp-emulator's "
+                     "Bluetooth interception")
+ap.add_argument("--bumble-python", default=sys.executable,
+                help="a Python with Bumble installed (pip install bumble)")
 ap.add_argument("cmds", nargs="*")
 a = ap.parse_args()
 
@@ -62,14 +77,35 @@ cmds = a.cmds or [
 ]
 
 log = open(a.log, "wb")
+if a.bt:
+    peer = subprocess.Popen(
+        [a.bumble_python,
+         os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "bt-peer.py")],
+        stdout=open(a.log + ".bt-peer", "w"), stderr=subprocess.STDOUT)
+    atexit.register(peer.terminate)
+    time.sleep(3)
+# Wi-Fi's gateway: esp-emulator's NAT, or the QEMU stand-in's own
+# user-mode network (apart from the Ethernet's 10.0.2.0/24).
+gateway = "192.168.4.1" if a.esp_emu else "10.0.4.2"
 if a.esp_emu:
     argv = [a.esp_emu, "--chip", "esp32s31", "--firmware", a.flash,
             "--net", "user"]
+    if a.bt:
+        argv += ["--elf", a.espcp_elf, "--ble-hci", "tcp:localhost:9544"]
 else:
     argv = [a.qemu, "-M", "esp32s31,flash=" + a.flash + a.machopts,
             "-nographic", "-serial", "mon:stdio", "-monitor", "none"]
     if a.net:
         argv += ["-nic", "user"]
+    if a.wifi:
+        # The co-processor stand-in's access point.
+        argv += ["-nic", "user,model=espwifi,net=10.0.4.0/24",
+                 "-global", "esp32s31-coproc.ssid=myssid",
+                 "-global", "esp32s31-coproc.password=mypassword"]
+    if a.bt:
+        argv += ["-chardev", "socket,id=bt,host=localhost,port=9544",
+                 "-global", "esp32s31-coproc.chardev=bt"]
     if a.usj:
         # The USB-Serial/JTAG port is QEMU's second serial port.
         with socket.socket() as probe:
@@ -115,7 +151,15 @@ for c in cmds:
     print(f"$ {c}\n{out.split(chr(10), 1)[1] if chr(10) in out else out}")
 def check(name, cmd, want, timeout=120):
     child.sendline(cmd)
-    child.expect("esp32s31# ", timeout=timeout)
+    try:
+        child.expect("esp32s31# ", timeout=timeout)
+    except pexpect.TIMEOUT:
+        if a.esp_emu:
+            # ^C would stop esp-emu itself; wait some more.
+            child.expect("esp32s31# ", timeout=timeout)
+        else:
+            child.sendcontrol("c")
+            child.expect("esp32s31# ", timeout=30)
     out = child.before.decode(errors="replace").split("\n", 1)[-1]
     ok = want in out
     print(f"{name}: {'ok' if ok else 'FAILED'}", flush=True)
@@ -133,6 +177,31 @@ if a.net:
     check("ping", "ping -c 3 -w 10 $(netstat -rn -f inet |"
           " awk '$1 == \"default\" { print $2; exit }')",
           " 0.0% packet loss")
+if a.wifi:
+    # esp-emulator's Ethernet and Wi-Fi share one network and one DHCP
+    # address: keep the Ethernet out of the way.
+    child.sendline("dhcpcd -x awge0; ifconfig awge0 down")
+    child.expect("esp32s31# ")
+    check("wifi scan", "espwifictl scan", "myssid", 60)
+    check("wifi join", "espwifictl join myssid mypassword &&"
+          " espwifictl wait 60", "associated with \"myssid\"", 120)
+    check("wifi dhcp", "i=0; while ! netstat -rn -f inet |"
+          " grep -q '^default.*espwifi0' && [ $i -lt 60 ]; do sleep 1;"
+          " i=$((i+1)); done; netstat -rn -f inet | grep ^default",
+          "espwifi0", 180)
+    check("wifi ping", f"ping -c 3 -w 10 {gateway}", " 0.0% packet loss")
+    check("wifi http", f"ftp -o /tmp/blob http://{gateway}:8088/blob.bin"
+          " >/dev/null 2>&1; sha256 -q /tmp/blob",
+          open("/tmp/httproot/blob.sha").read().split()[0]
+          if os.path.exists("/tmp/httproot/blob.sha") else "no-blob", 300)
+if a.bt:
+    check("bt up", "btconfig espbt0 up && btconfig espbt0", "UP", 60)
+    check("bt inquiry", "btconfig espbt0 inquiry", "aa:bb:cc:dd:ee:01", 120)
+    check("bt sdp", "sdpquery -a aa:bb:cc:dd:ee:01 search SP",
+          "Bumble echo", 120)
+    check("bt rfcomm", "(echo hello-rfcomm; sleep 4) |"
+          " rfcomm_sppd -a aa:bb:cc:dd:ee:01 -s SP & sleep 10; kill $! 2>/dev/null",
+          "HELLO-RFCOMM", 120)
 def usj_session():
     """Log in on the USB-Serial/JTAG port and run a command there."""
     sock = socket.create_connection(("127.0.0.1", usj_port), timeout=5)
@@ -225,3 +294,4 @@ try:
 except pexpect.TIMEOUT:
     child.terminate(force=True)
 print(f"done after {time.time() - t0:.1f}s")
+

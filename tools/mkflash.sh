@@ -7,14 +7,15 @@
 #   0x100000  u-boot.itb (OpenSBI fw_dynamic + U-Boot + U-Boot dtb)
 #   0x300000  device tree for the kernel  (XIP 0x40200000)
 #   0x500000  kernel Image                (XIP 0x40400000, booti), <= 4MiB
-#   0x900000  root file system (FFS)      (XIP 0x40800000), <= 7MiB
+#   0x900000  root file system (FFS)      (XIP 0x40800000), <= 4MiB
+#   0xd00000  radio co-processor firmware (XIP 0x40c00000), <= 3MiB
 #
 # usage: mkflash.sh u-boot-spl-dtb.bin u-boot.itb kernel.dtb kernel.img \
-#            rootfs.img out.bin
+#            rootfs.img out.bin [espcp.img]
 #
 set -eu
 
-SPL=$1 ITB=$2 DTB=$3 IMG=$4 ROOTFS=$5 OUT=$6
+SPL=$1 ITB=$2 DTB=$3 IMG=$4 ROOTFS=$5 OUT=$6 ESPCP=${7:-}
 TOOLDIR=${TOOLDIR:?set TOOLDIR to the NetBSD tool directory}
 CROSS=${CROSS:-$TOOLDIR/bin/riscv32--netbsd-}
 ESPTOOL=${ESPTOOL:-esptool}
@@ -39,7 +40,12 @@ toobig() {	# file limit what
 	fi
 }
 toobig "$IMG" $((0x900000 - 0x500000)) "kernel image"
-toobig "$ROOTFS" $((0x1000000 - 0x900000)) "root file system"
+toobig "$ROOTFS" $((0xd00000 - 0x900000)) "root file system"
+FW=
+if [ -n "$ESPCP" ]; then
+	toobig "$ESPCP" $((0x1000000 - 0xd00000)) "co-processor firmware"
+	FW="0xd00000 $ESPCP"
+fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -58,5 +64,5 @@ $ESPTOOL --chip esp32s31 merge-bin -o "$OUT" --format raw $FLASHARGS \
     0x100000 "$ITB" \
     0x300000 "$DTB" \
     0x500000 "$IMG" \
-    0x900000 "$ROOTFS"
+    0x900000 "$ROOTFS" $FW
 echo "wrote $OUT ($(fsize "$OUT") bytes)"

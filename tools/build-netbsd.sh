@@ -60,6 +60,7 @@ for d in \
     lib/libcrypt \
     lib/libm \
     lib/libprop \
+    lib/libbluetooth \
     lib/libbz2 \
     lib/libz
 do

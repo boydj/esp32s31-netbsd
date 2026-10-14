@@ -6,6 +6,8 @@
 #   opensbi-esp  Espressif OpenSBI, ESP32-S31 integration branch (pinned)
 #   uboot-esp    Espressif U-Boot,  ESP32-S31 integration branch (pinned)
 #   qemu         QEMU v11.1.2 + the esp32s31 machine (qemu/patches)
+#   esp-idf      ESP-IDF (pinned), for the Wi-Fi/Bluetooth co-processor
+#                firmware (espcp/); NO_ESPCP=1 skips it
 #
 set -eu
 
@@ -22,6 +24,8 @@ UBOOT_BRANCH=integration/v2024.07-esp32s31
 UBOOT_REV=b2ec9ae21622f92d35462f5ae3bf053466998cc6
 QEMU_URL=${QEMU_URL:-https://github.com/qemu/qemu.git}
 QEMU_TAG=v11.1.2
+IDF_URL=https://github.com/espressif/esp-idf.git
+IDF_REV=ab95e70748f2eddac6f87217b0cf62533684a6ba
 
 mkdir -p "$W"
 cd "$W"
@@ -52,5 +56,9 @@ if [ ! -d qemu ]; then
 			    "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 		done
 	fi
+fi
+if [ "${NO_ESPCP:-0}" != 1 ]; then
+	pinned esp-idf "$IDF_URL" "$IDF_REV"
+	git -C esp-idf submodule update -q --init --recursive --depth 1
 fi
 echo "sources in $W"

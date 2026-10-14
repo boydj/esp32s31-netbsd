@@ -1,0 +1,138 @@
+From aabbb410d9aeffb6c81dd7acef96cb61a1725c36 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 08:07:33 -0400
+Subject: [PATCH] platform: esp32s31: vendor calls to run a co-processor
+ firmware on hart 1
+
+Add S31_SBI_HART1_BOOT (0x100) and S31_SBI_HART1_RESET (0x101) to the
+vendor extension.  BOOT starts hart 1 in M-mode at a0 -- a firmware the
+S-mode OS on hart 0 loaded, such as an ESP-IDF build running the Wi-Fi
+and Bluetooth stacks -- and RESET puts hart 1 back in reset.  Both are
+refused while OpenSBI's HSM has hart 1 running.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ .../generic/espressif/esp32s31/esp32s31.c     | 43 +++++++++++++++++++
+ platform/generic/espressif/esp32s31/hsm.c     | 21 +++++++++
+ .../generic/espressif/esp32s31/platform.h     |  2 +
+ 3 files changed, 66 insertions(+)
+
+diff --git a/platform/generic/espressif/esp32s31/esp32s31.c b/platform/generic/espressif/esp32s31/esp32s31.c
+index f108f3f..77768e2 100644
+--- a/platform/generic/espressif/esp32s31/esp32s31.c
++++ b/platform/generic/espressif/esp32s31/esp32s31.c
+@@ -19,9 +19,14 @@
+ #include <sbi_utils/fdt/fdt_helper.h>
+ #include <sbi_utils/serial/esp_uart.h>
+ 
++#include <sbi/sbi_hsm.h>
++
+ #include "cache_mmu.h"
++#include "config.h"
+ #include "platform.h"
+ 
++extern char _fw_end[];
++
+ /* Espressif PMA (Physical Memory Attributes) CSR base addresses — custom
+  * extension on top of standard PMP. 16 entries each: bit 0 = EN, bit 2 =
+  * X, bit 3 = W, bit 4 = R, bit 29 = L, bits 30-31 = address-mode A
+@@ -148,6 +153,28 @@ static int esp32s31_final_init(bool cold_boot, void *fdt,
+ #define S31_SBI_ICACHE_SYNC_RANGE  4
+ #define S31_SBI_DCACHE_WBACK_ALL   5
+ 
++/*
++ * Vendor SBI extension: a co-processor firmware on hart 1.  BOOT starts
++ * hart 1 in M-mode at a0 (it must not be running anything), RESET puts it
++ * back in reset.  The S-mode OS on hart 0 owns the firmware and the memory
++ * it runs in.
++ */
++#define S31_SBI_HART1_BOOT         0x100
++#define S31_SBI_HART1_RESET        0x101
++
++static bool s31_hart1_entry_valid(u32 addr)
++{
++	if (addr & 3)
++		return false;
++	/* HP RAM above OpenSBI, the flash XIP window or PSRAM. */
++	if (addr >= (u32)(unsigned long)_fw_end &&
++	    addr < HP_RAM_START + HP_RAM_SIZE)
++		return true;
++	if (addr >= FLASH_START && addr < FLASH_START + FLASH_SIZE)
++		return true;
++	return addr >= PSRAM_START && addr < PSRAM_START + PSRAM_SIZE;
++}
++
+ static int esp32s31_vendor_ext_provider(long funcid,
+ 					struct sbi_trap_regs *regs,
+ 					struct sbi_ecall_return *out,
+@@ -170,6 +197,22 @@ static int esp32s31_vendor_ext_provider(long funcid,
+ 	}
+ 
+ 	switch (funcid) {
++	case S31_SBI_HART1_BOOT:
++		if (!s31_hart1_entry_valid(vaddr))
++			return SBI_ERR_INVALID_PARAM;
++		if (sbi_hsm_hart_get_state(sbi_domain_thishart_ptr(), 1) !=
++		    SBI_HSM_STATE_STOPPED)
++			return SBI_ERR_ALREADY_STARTED;
++		s31_hart1_reset();
++		if (s31_hart1_boot_mmode(vaddr) != 0)
++			return SBI_ERR_FAILED;
++		break;
++	case S31_SBI_HART1_RESET:
++		if (sbi_hsm_hart_get_state(sbi_domain_thishart_ptr(), 1) !=
++		    SBI_HSM_STATE_STOPPED)
++			return SBI_ERR_DENIED;
++		s31_hart1_reset();
++		break;
+ 	case S31_SBI_CACHE_WBACK:
+ 		s31_dcache_writeback(vaddr, size);
+ 		break;
+diff --git a/platform/generic/espressif/esp32s31/hsm.c b/platform/generic/espressif/esp32s31/hsm.c
+index 5e364d3..fb47edf 100644
+--- a/platform/generic/espressif/esp32s31/hsm.c
++++ b/platform/generic/espressif/esp32s31/hsm.c
+@@ -69,6 +69,27 @@ static int s31_hart_stop(void)
+ 		wfi();
+ }
+ 
++/*
++ * Start hart 1 in M-mode at addr, outside OpenSBI: for a co-processor
++ * firmware (ESP-IDF's Wi-Fi and Bluetooth stack) running alongside the
++ * S-mode OS on hart 0.  Hart 1 must not be in use by OpenSBI.
++ */
++int s31_hart1_boot_mmode(ulong addr)
++{
++	return s31_hart_start(1, addr);
++}
++
++/* Put hart 1 back in reset, whatever it is running. */
++void s31_hart1_reset(void)
++{
++	u32 v;
++
++	v = readl((void *)S31_HPCORE1_CTRL0_REG);
++	v &= ~(S31_HPCORE1_CLIC_CLK_EN | S31_HPCORE1_CPU_CLK_EN);
++	v |= S31_HPCORE1_GLOBAL_RST_EN;
++	writel(v, (void *)S31_HPCORE1_CTRL0_REG);
++}
++
+ static const struct sbi_hsm_device s31_hsm = {
+ 	.name		= "esp32s31-hsm",
+ 	.hart_start	= s31_hart_start,
+diff --git a/platform/generic/espressif/esp32s31/platform.h b/platform/generic/espressif/esp32s31/platform.h
+index bc0ee1f..f35f625 100644
+--- a/platform/generic/espressif/esp32s31/platform.h
++++ b/platform/generic/espressif/esp32s31/platform.h
+@@ -12,5 +12,7 @@ void s31_tee_supervisor_priv_sel_to_m(void);
+ 
+ /* hsm.c -- hart 1 (CPU1) start and stop for SMP. */
+ void s31_hsm_register(void);
++int s31_hart1_boot_mmode(unsigned long addr);
++void s31_hart1_reset(void);
+ 
+ #endif /* _ESP32S31_PLATFORM_H_ */
+-- 
+2.43.0
+

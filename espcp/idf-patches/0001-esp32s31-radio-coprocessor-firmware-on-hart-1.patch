@@ -1,0 +1,322 @@
+ESP-IDF: build an application as the ESP32-S31 radio co-processor firmware
+
+With CONFIG_ESPCP_FIRMWARE (espcp/components/espcp_sys/Kconfig), a
+single-core application runs on hart 1 while another OS (NetBSD) runs on
+hart 0, so it must not touch what that OS owns:
+
+ - rv_utils_get_core_id() says 0 on hart 1; espcp_sys routes interrupts
+   to the hart that is really running.
+ - The FreeRTOS tick uses systimer alarm 1 and leaves the systimer itself,
+   counter 0 and alarm 0 to the host; esp_timer doesn't reset it either.
+ - No flash driver and no partition-table protection: the host owns the
+   SPI flash.
+ - Panics and restarts report to the host and stop the hart instead of
+   resetting the chip (and no RTC watchdog).
+ - The image runs in place from its own flash partition, and its RAM
+   starts above OpenSBI.
+
+Against ESP-IDF ab95e707 (master, 2026-10).
+
+diff --git a/components/esp_partition/partition_target.c b/components/esp_partition/partition_target.c
+index 5f834676..52cc1eca 100644
+--- a/components/esp_partition/partition_target.c
++++ b/components/esp_partition/partition_target.c
+@@ -283,7 +283,7 @@ uint32_t esp_partition_get_main_flash_sector_size(void)
+     return SPI_FLASH_SEC_SIZE;
+ }
+ 
+-#if !CONFIG_APP_BUILD_TYPE_PURE_RAM_APP
++#if !CONFIG_APP_BUILD_TYPE_PURE_RAM_APP && !CONFIG_ESPCP_FIRMWARE
+ ESP_SYSTEM_INIT_FN(esp_partition_flash_region_protection_init, CORE, BIT(0), 131)
+ {
+     esp_flash_partition_ops_t ops = {
+diff --git a/components/esp_system/esp_system.c b/components/esp_system/esp_system.c
+index 353bc879..d0122ea1 100644
+--- a/components/esp_system/esp_system.c
++++ b/components/esp_system/esp_system.c
+@@ -44,8 +44,17 @@ esp_err_t esp_unregister_shutdown_handler(shutdown_handler_t handler)
+     return err;
+ }
+ 
++#if CONFIG_ESPCP_FIRMWARE
++/* Co-processor firmware: report to the host OS and stop this hart instead
++ * of resetting the chip the host is running on. */
++extern void espcp_halt(const char *why) __attribute__((noreturn));
++#endif
++
+ void esp_restart(void)
+ {
++#if CONFIG_ESPCP_FIRMWARE
++    espcp_halt("esp_restart");
++#endif
+     esp_sys_event_trigger(ESP_SYS_EVENT_SHUTDOWN, NULL);
+ 
+ #if ( ( CONFIG_FREERTOS_SMP ) && ( !CONFIG_FREERTOS_UNICORE ) )
+diff --git a/components/esp_system/ld/esp32s31/memory.ld.in b/components/esp_system/ld/esp32s31/memory.ld.in
+index 7c40af2f..bcf8f3d5 100644
+--- a/components/esp_system/ld/esp32s31/memory.ld.in
++++ b/components/esp_system/ld/esp32s31/memory.ld.in
+@@ -16,7 +16,20 @@
+ #include "ld.common"
+ #include "ld.hp_mem_defs"
+ 
++#if CONFIG_ESPCP_FIRMWARE
++/*
++ * Co-processor firmware on hart 1: OpenSBI (for the OS on hart 0) owns the
++ * start of the SRAM, and the image runs in place from its own flash
++ * partition, after a page for its header.
++ */
++#define SRAM_START     CONFIG_ESPCP_SRAM_START
++#define FLASH_ORG      (CONFIG_ESPCP_XIP_BASE + 0x1000)
++#define FLASH_LEN      (CONFIG_ESPCP_XIP_SIZE - 0x1000)
++#else
+ #define SRAM_START     0x2F000000
++#define FLASH_ORG      0x40000020
++#define FLASH_LEN      (IDROM_SEG_SIZE - 0x20)
++#endif
+ #if CONFIG_ULP_COPROC_RUN_FROM_HP_MEM
+ #define SRAM_SIZE      (ULP_HP_MEM_START - SRAM_START)
+ #else
+@@ -34,7 +47,7 @@ MEMORY
+   irom_seg (RX) :                    org = 0x50000020, len = IDROM_SEG_SIZE - 0x20
+ #else
+   /* Flash mapped instruction data */
+-  irom_seg (RX) :                    org = 0x40000020, len = IDROM_SEG_SIZE - 0x20
++  irom_seg (RX) :                    org = FLASH_ORG, len = FLASH_LEN
+ 
+   /**
+    * (0x20 offset above is a convenience for the app binary image generation.
+@@ -58,7 +71,7 @@ MEMORY
+   drom_seg (R) :                     org = 0x50000020, len = IDROM_SEG_SIZE - 0x20
+ #else
+   /* Flash mapped constant data */
+-  drom_seg (R) :                     org = 0x40000020, len = IDROM_SEG_SIZE - 0x20
++  drom_seg (R) :                     org = FLASH_ORG, len = FLASH_LEN
+ #endif // CONFIG_SPIRAM_RODATA
+ 
+   /* (See irom_seg for meaning of 0x20 offset in the above.) */
+diff --git a/components/esp_system/panic.c b/components/esp_system/panic.c
+index 4aa771e6..95248743 100644
+--- a/components/esp_system/panic.c
++++ b/components/esp_system/panic.c
+@@ -113,8 +113,18 @@ static void panic_print_char_usb_serial_jtag(const char c)
+ }
+ #endif //CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG || CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG
+ 
++#if CONFIG_ESPCP_FIRMWARE
++/* Co-processor firmware: report to the host OS and stop this hart instead
++ * of resetting the chip the host is running on. */
++extern void espcp_halt(const char *why) __attribute__((noreturn));
++extern void espcp_panic_putc(char c);
++#endif
++
+ void panic_print_char(const char c)
+ {
++#if CONFIG_ESPCP_FIRMWARE
++    espcp_panic_putc(c);
++#endif
+ #if CONFIG_ESP_CONSOLE_UART
+     panic_print_char_uart(c);
+ #endif
+@@ -197,6 +207,11 @@ void esp_panic_handler_disable_timg_wdts(void)
+ /* This function enables the RTC WDT with the given timeout in milliseconds */
+ void esp_panic_handler_enable_rtc_wdt(uint32_t timeout_ms)
+ {
++#if CONFIG_ESPCP_FIRMWARE
++    /* The RTC WDT would reset the whole chip. */
++    (void)timeout_ms;
++    return;
++#endif
+     wdt_hal_context_t rtc_wdt_ctx = RWDT_HAL_CONTEXT_DEFAULT(); // Use a local context variable to avoid race conditions when both cores enter the panic handler
+     wdt_hal_init(&rtc_wdt_ctx, WDT_RWDT, 0, false);
+     uint32_t stage_timeout_ticks = (uint32_t)(timeout_ms * rtc_clk_slow_freq_get_hz() / 1000ULL);
+@@ -296,6 +311,9 @@ void panic_disable_all_wdts(void)
+ void IRAM_ATTR esp_panic_handler_reset_modules_on_exit_and_halt(void)
+ {
+     // Do not print or call non-IRAM functions beyond this point
++#if CONFIG_ESPCP_FIRMWARE
++    espcp_halt("panic");
++#endif
+     esp_system_reset_modules_on_exit();
+     ESP_INFINITE_LOOP();
+ }
+diff --git a/components/esp_system/port/panic_handler.c b/components/esp_system/port/panic_handler.c
+index ff1f0276..41411b28 100644
+--- a/components/esp_system/port/panic_handler.c
++++ b/components/esp_system/port/panic_handler.c
+@@ -336,8 +336,17 @@ void IRAM_ATTR xt_unhandled_exception(void *frame)
+     panic_handler(frame, false);
+ }
+ 
++#if CONFIG_ESPCP_FIRMWARE
++/* Co-processor firmware: report to the host OS and stop this hart instead
++ * of resetting the chip the host is running on. */
++extern void espcp_halt(const char *why) __attribute__((noreturn));
++#endif
++
+ void __attribute__((noreturn)) panic_restart(void)
+ {
++#if CONFIG_ESPCP_FIRMWARE
++    espcp_halt("panic");
++#endif
+ #ifdef CONFIG_IDF_TARGET_ESP32
+     // On the ESP32, cache error status can only be cleared by system reset
+     if (esp_cache_err_get_cpuid() != -1) {
+diff --git a/components/esp_system/port/soc/esp32s31/system_internal.c b/components/esp_system/port/soc/esp32s31/system_internal.c
+index fc1e07ca..f687c495 100644
+--- a/components/esp_system/port/soc/esp32s31/system_internal.c
++++ b/components/esp_system/port/soc/esp32s31/system_internal.c
+@@ -141,8 +141,17 @@ static void IRAM_ATTR __attribute__((noinline, noreturn)) esp_restart_noos_inner
+  * core are already stopped. Stalls other core, resets hardware,
+  * triggers restart.
+ */
++#if CONFIG_ESPCP_FIRMWARE
++/* Co-processor firmware: report to the host OS and stop this hart instead
++ * of resetting the chip the host is running on. */
++extern void espcp_halt(const char *why) __attribute__((noreturn));
++#endif
++
+ void esp_restart_noos(void)
+ {
++#if CONFIG_ESPCP_FIRMWARE
++    espcp_halt("esp_restart_noos");
++#endif
+     // Disable interrupts
+     rv_utils_intr_global_disable();
+ #if SOC_RTC_WDT_SUPPORTED
+diff --git a/components/esp_timer/src/esp_timer_impl_systimer.c b/components/esp_timer/src/esp_timer_impl_systimer.c
+index 237a4350..0b5dfa89 100644
+--- a/components/esp_timer/src/esp_timer_impl_systimer.c
++++ b/components/esp_timer/src/esp_timer_impl_systimer.c
+@@ -149,6 +149,8 @@ void esp_timer_impl_advance(int64_t time_diff_us)
+ 
+ esp_err_t esp_timer_impl_early_init(void)
+ {
++#if !CONFIG_ESPCP_FIRMWARE
++    /* (A co-processor firmware shares the running systimer with hart 0.) */
+     PERIPH_RCC_ACQUIRE_ATOMIC(PERIPH_SYSTIMER_MODULE, ref_count) {
+         if (ref_count == 0) {
+             systimer_ll_enable_bus_clock(true);
+@@ -156,6 +158,7 @@ esp_err_t esp_timer_impl_early_init(void)
+             systimer_ll_enable_sys_clock(true);
+         }
+     }
++#endif
+     systimer_hal_tick_rate_ops_t ops = {
+         .ticks_to_us = systimer_ticks_to_us,
+         .us_to_ticks = systimer_us_to_ticks,
+@@ -174,10 +177,12 @@ esp_err_t esp_timer_impl_early_init(void)
+     systimer_hal_select_alarm_mode(&systimer_hal, SYSTIMER_ALARM_ESPTIMER, SYSTIMER_ALARM_MODE_ONESHOT);
+     systimer_hal_connect_alarm_counter(&systimer_hal, SYSTIMER_ALARM_ESPTIMER, SYSTIMER_COUNTER_ESPTIMER);
+ 
++#if !CONFIG_ESPCP_FIRMWARE
+     for (unsigned cpuid = 0; cpuid < SOC_CPU_CORES_NUM; ++cpuid) {
+         bool can_stall = (cpuid < portNUM_PROCESSORS);
+         systimer_hal_counter_can_stall_by_cpu(&systimer_hal, SYSTIMER_COUNTER_ESPTIMER, cpuid, can_stall);
+     }
++#endif
+ 
+     return ESP_OK;
+ }
+diff --git a/components/freertos/port_systick.c b/components/freertos/port_systick.c
+index 505d41da..b3d0a3de 100644
+--- a/components/freertos/port_systick.c
++++ b/components/freertos/port_systick.c
+@@ -60,6 +60,42 @@ static systimer_hal_context_t systimer_hal;
+  * It is done at the same time so SysTicks for both CPUs occur at the same time or very close.
+  * Shifts a time of triggering interrupts for core 0 and core 1.
+  */
++#if CONFIG_ESPCP_FIRMWARE
++/*
++ * Co-processor firmware on hart 1: the OS on hart 0 already runs the
++ * systimer (counter 0 and alarm 0).  Don't reset or reconfigure it; tick
++ * from alarm 1 on counter 1.
++ */
++#define ESPCP_TICK_ALARM    (SYSTIMER_ALARM_OS_TICK_CORE0 + 1)
++#define SYSTICK_ALARM(cpuid)    ESPCP_TICK_ALARM
++
++void vSystimerSetup(void)
++{
++#ifdef CONFIG_FREERTOS_CORETIMER_SYSTIMER_LVL3
++    const unsigned level = ESP_INTR_FLAG_LEVEL3;
++#else
++    const unsigned level = ESP_INTR_FLAG_LEVEL1;
++#endif
++
++    ESP_ERROR_CHECK(esp_intr_alloc(ETS_SYSTIMER_TARGET0_INTR_SOURCE + 1, ESP_INTR_FLAG_IRAM | level, SysTickIsrHandler, &systimer_hal, NULL));
++
++    systimer_hal_init(&systimer_hal);
++    systimer_hal_tick_rate_ops_t ops = {
++        .ticks_to_us = systimer_ticks_to_us,
++        .us_to_ticks = systimer_us_to_ticks,
++    };
++    systimer_hal_set_tick_rate_ops(&systimer_hal, &ops);
++    systimer_ll_set_counter_value(systimer_hal.dev, SYSTIMER_COUNTER_OS_TICK, 0);
++    systimer_ll_apply_counter_value(systimer_hal.dev, SYSTIMER_COUNTER_OS_TICK);
++    systimer_hal_connect_alarm_counter(&systimer_hal, ESPCP_TICK_ALARM, SYSTIMER_COUNTER_OS_TICK);
++    systimer_hal_set_alarm_period(&systimer_hal, ESPCP_TICK_ALARM, 1000000UL / CONFIG_FREERTOS_HZ);
++    systimer_hal_select_alarm_mode(&systimer_hal, ESPCP_TICK_ALARM, SYSTIMER_ALARM_MODE_PERIOD);
++    systimer_hal_enable_alarm_int(&systimer_hal, ESPCP_TICK_ALARM);
++    systimer_hal_enable_counter(&systimer_hal, SYSTIMER_COUNTER_OS_TICK);
++}
++#else /* !CONFIG_ESPCP_FIRMWARE */
++#define SYSTICK_ALARM(cpuid)    (SYSTIMER_ALARM_OS_TICK_CORE0 + (cpuid))
++
+ void vSystimerSetup(void)
+ {
+     unsigned cpuid = xPortGetCoreID();
+@@ -118,6 +154,7 @@ void vSystimerSetup(void)
+         systimer_hal_enable_alarm_int(&systimer_hal, alarm_id);
+     }
+ }
++#endif /* !CONFIG_ESPCP_FIRMWARE */
+ 
+ /**
+  * @brief Systimer interrupt handler.
+@@ -133,7 +170,7 @@ void SysTickIsrHandler(void *arg)
+     ESP_PM_TRACE_ENTER(TICK, cpuid);
+ #endif
+ 
+-    uint32_t alarm_id = SYSTIMER_ALARM_OS_TICK_CORE0 + cpuid;
++    uint32_t alarm_id = SYSTICK_ALARM(cpuid);
+     do {
+         systimer_ll_clear_alarm_int(systimer_hal->dev, alarm_id);
+ 
+@@ -159,7 +196,7 @@ void SysTickIsrHandler(void *arg)
+ 
+ uint32_t xPortSysTickClaimElapsedTicks(int cpu_id)
+ {
+-    uint32_t alarm_id = SYSTIMER_ALARM_OS_TICK_CORE0 + (uint32_t)cpu_id;
++    uint32_t alarm_id = SYSTICK_ALARM((uint32_t)cpu_id);
+     uint32_t total = systimer_hal_get_counter_value(&systimer_hal, SYSTIMER_COUNTER_OS_TICK) / systimer_ll_get_alarm_period(systimer_hal.dev, alarm_id);
+     uint32_t elapsed = total - s_handled_systicks[cpu_id];
+     if (elapsed == 0) {
+diff --git a/components/riscv/include/riscv/rv_utils.h b/components/riscv/include/riscv/rv_utils.h
+index 44af2477..2170e1b3 100644
+--- a/components/riscv/include/riscv/rv_utils.h
++++ b/components/riscv/include/riscv/rv_utils.h
+@@ -90,7 +90,10 @@ FORCE_INLINE_ATTR void __attribute__((always_inline)) rv_utils_wait_for_intr(voi
+ 
+ FORCE_INLINE_ATTR __attribute__((pure)) uint32_t rv_utils_get_core_id(void)
+ {
+-#if SOC_CPU_CORES_NUM == 1
++#if SOC_CPU_CORES_NUM == 1 || CONFIG_ESPCP_FIRMWARE
++    /* A co-processor firmware is a single-core build that runs on hart 1
++     * (hart 0 runs another OS): software sees itself as core 0.  Code that
++     * picks per-hart hardware reads mhartid itself. */
+     return 0; // No need to check core ID on single core hardware
+ #else
+     uint32_t cpuid;
+diff --git a/components/spi_flash/esp_flash_spi_init.c b/components/spi_flash/esp_flash_spi_init.c
+index 587d328c..ef564969 100644
+--- a/components/spi_flash/esp_flash_spi_init.c
++++ b/components/spi_flash/esp_flash_spi_init.c
+@@ -642,7 +642,7 @@ esp_err_t esp_flash_app_init(void)
+     return err;
+ }
+ 
+-#if !CONFIG_APP_BUILD_TYPE_PURE_RAM_APP
++#if !CONFIG_APP_BUILD_TYPE_PURE_RAM_APP && !CONFIG_ESPCP_FIRMWARE
+ ESP_SYSTEM_INIT_FN(init_flash, CORE, BIT(0), 130)
+ {
+ #if CONFIG_SPI_FLASH_ROM_IMPL
