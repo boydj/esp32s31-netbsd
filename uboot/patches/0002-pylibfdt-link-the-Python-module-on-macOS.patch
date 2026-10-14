@@ -1,0 +1,43 @@
+From 8e856f38c2db49a370a1f16b4758771de22c5f8c Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Tue, 13 Oct 2026 22:25:43 -0400
+Subject: [PATCH] scripts/dtc/pylibfdt: link the Python module on macOS
+
+The module is linked with "$(HOSTCC) -shared", which leaves the Python
+API symbols undefined.  GNU ld accepts that, but macOS's linker fails
+with "Undefined symbols ... _PyArg_UnpackTuple ...".  On Darwin link it
+the way Python itself links extensions there: -bundle -undefined
+dynamic_lookup.
+
+Host-side only: the firmware images are unchanged.
+---
+ scripts/dtc/pylibfdt/Makefile | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/dtc/pylibfdt/Makefile b/scripts/dtc/pylibfdt/Makefile
+index e442d5c2..fbf01d82 100644
+--- a/scripts/dtc/pylibfdt/Makefile
++++ b/scripts/dtc/pylibfdt/Makefile
+@@ -16,9 +16,18 @@ PYLIBFDT_srcs = $(addprefix $(LIBFDT_srcdir)/,$(LIBFDT_SRCS)) \
+ # create a version string compliant with PEP 440
+ PEP_VERSION = $(VERSION)$(if $(PATCHLEVEL),.$(PATCHLEVEL)$(if $(SUBLEVEL),.$(SUBLEVEL)))$(subst -,,$(EXTRAVERSION))
+ 
++# A Python extension leaves the interpreter's symbols undefined, to be bound
++# when it is loaded.  GNU ld allows that for -shared; on macOS it must be
++# asked for (this is how Python itself links extensions there).
++ifeq ($(HOSTOS),darwin)
++PYLIBFDT_LDSHARED = $(HOSTCC) -bundle -undefined dynamic_lookup
++else
++PYLIBFDT_LDSHARED = $(HOSTCC) -shared
++endif
++
+ quiet_cmd_pymod = PYMOD   $@
+       cmd_pymod = unset CROSS_COMPILE; unset CFLAGS; \
+-		CC="$(HOSTCC)" LDSHARED="$(HOSTCC) -shared " \
++		CC="$(HOSTCC)" LDSHARED="$(PYLIBFDT_LDSHARED) " \
+ 		LDFLAGS="$(HOSTLDFLAGS)" \
+ 		VERSION="$(PEP_VERSION)" \
+ 		CPPFLAGS="$(HOSTCFLAGS) -I$(LIBFDT_srcdir)" OBJDIR=$(obj) \
+-- 
+2.43.0
+
