@@ -27,5 +27,6 @@ c.sendcontrol("d")
 c.expect("esp32s31# ")
 c.sendline("stty echo; wc -c /tmp/x; sort -u /tmp/x | wc -l")
 c.expect("esp32s31# ")
-print("sent", total, "->", c.before.decode(errors="replace").strip().splitlines()[-2:])
+out = [l.strip() for l in c.before.decode(errors="replace").splitlines() if l.strip()]
+print(f"sent {total} bytes; received: {out[-2]}, distinct lines: {out[-1]}")
 c.terminate(force=True)
