@@ -5,7 +5,8 @@ serial console and run a few commands.
 
 usage: boot-test.py [--qemu PATH | --esp-emu PATH] [--flash FILE]
                     [--reboots N] [--vi] [--net] [--fptest] [--usb] [--gpio]
-                    [--usj] [--sd] [--wifi] [--bt]
+                    [--usj] [--sd] [--uart] [--hw] [--power] [--persist]
+                    [--crypto] [--wifi] [--bt]
                     [cmd ...]
 """
 import argparse
@@ -52,7 +53,8 @@ ap.add_argument("--gpio", action="store_true",
 ap.add_argument("--uart", action="store_true",
                 help="UART1 through a TCP echo peer (QEMU only)")
 ap.add_argument("--hw", action="store_true",
-                help="sensors, RTC time across a reboot, watchdog reset")
+                help="sensors, ADC, comparator, RTC time across a reboot,"
+                     " audio, CAN, PWM, then the watchdog's reset")
 ap.add_argument("--power", action="store_true",
                 help="CPU clock changes, and power-off as deep sleep with a"
                      " timed wake-up (which is a reset)")

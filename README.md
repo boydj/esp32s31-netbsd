@@ -3,8 +3,8 @@
 A native NetBSD/riscv32 port to the **ESP32-S31**, Espressif's RISC-V
 part with a real Sv32 MMU and 16 MiB of PSRAM.  It runs a real kernel
 with virtual memory, processes, Ethernet, Wi-Fi, Bluetooth, USB, an SD
-card and a multi-user login, not an emulator.  It is booted by
-Espressif's own boot chain:
+card, I2C, SPI, CAN, audio, PWM and a multi-user login, not an emulator.
+It is booted by Espressif's own boot chain:
 
 ```
 mask ROM -> U-Boot SPL -> OpenSBI -> U-Boot (booti) -> esp32s31-loader -> NetBSD (hart 0)
@@ -29,8 +29,8 @@ emulators.  It has not been run on silicon yet.**
 
 | | |
 |---|---|
-| QEMU (`-M esp32s31`, `qemu/` here) | boots, multi-user, all tests pass; Wi-Fi and Bluetooth through a model of the co-processor |
-| [esp-emulator](https://github.com/espressif/esp-emulator) v0.49.0, real ESP32-S31 mask ROM | boots, multi-user, all tests pass, including Wi-Fi with the real ESP-IDF firmware on hart 1 (it has no USB OTG or SD model, and can't emulate Bluetooth on hart 1) |
+| QEMU (`-M esp32s31`, `qemu/` here) | boots, multi-user, all tests pass; Wi-Fi and Bluetooth through a model of the co-processor, CAN between the two controllers, I2S audio through the GDMA |
+| [esp-emulator](https://github.com/espressif/esp-emulator) v0.49.0, real ESP32-S31 mask ROM | boots, multi-user, all tests pass, including Wi-Fi and CPU clock changes with the real ESP-IDF firmware on hart 1, the crypto engines and flash writes (it has no USB OTG, SD, CAN, I2S or ADC model, can't emulate Bluetooth on hart 1, and turns deep sleep into a watchdog reset) |
 | Real hardware | untested |
 
 What works:
@@ -43,6 +43,11 @@ What works:
   eagerly when it doesn't.  `fptest` checks it.
 * **Root file system:** read straight out of SPI flash through the XIP
   window, so all of PSRAM is left for the kernel and processes.
+* **Persistent storage:** a 1 MiB flash partition (`espnor0`), written
+  while the system keeps running from flash, holds `/persist`; `/etc` is
+  union-mounted over `/persist/etc`, so configuration survives resets.
+* **Clock:** the RTC timer keeps the time of day across resets and deep
+  sleep (not across power loss).
 * **Consoles:** UART0 (interrupt-driven, tested with a 20 KB input
   flood) and the USB-Serial/JTAG port, the board's "USB" connector,
   which the host sees as a CDC-ACM serial port.  Either can be the
@@ -64,58 +69,91 @@ What works:
 * **Bluetooth** (BR/EDR and LE controller) under NetBSD's `bluetooth(4)`
   stack: `btconfig espbt0 up`, `btconfig espbt0 inquiry`, `sdpquery`,
   `rfcomm_sppd`.
-* **GPIO** through `gpioctl(8)`.
+* **GPIO** through `gpioctl(8)`, and any pin can be given a peripheral
+  signal (UART, I2C, SPI, PWM, CAN, I2S) with `sysctl`.
+* **UART1-3** (`/dev/ttyEU1`-`3`), **I2C** (two controllers: `i2cscan`,
+  `i2cxfer`), **SPI** (two masters: `spixfer`).
+* **CAN** (two controllers, `esptwai0`/`1`): `canconfig`, `cansend`,
+  `candump`.
+* **Audio:** I2S to a DAC, amplifier or microphone, 8-48 kHz stereo,
+  `audioplay`/`audiorecord`.
+* **PWM:** 16 LED PWM channels and 24 motor control PWM outputs, from
+  `sysctl` or for `pwm(9)` users.
+* **Sensors:** the temperature sensor, 16 ADC channels and the analog
+  comparator under `envstat(8)`.
+* **Hardware crypto:** AES for the kernel, SHA/HMAC and RSA modular
+  exponentiation through `/dev/crypto`.
+* **Watchdog** (`wdogctl`), **CPU clock scaling** (320/160/80 MHz) and
+  **power-off as deep sleep**, with an optional timed or GPIO wake-up.
 * **Entropy:** the hardware TRNG is the entropy source.
 
 The root file system has `sh`, `vi`, `awk`, `sed`, `grep`, `less`, `ps`,
-`vmstat`, `sysctl`, ... and is read-only; `/tmp`, `/var` and `/root` are
-tmpfs.  About 12 MiB of RAM is free for the system after the kernel and
-the radio firmware's share.
+`vmstat`, `sysctl`, ... and is read-only apart from `/etc`; `/tmp`,
+`/var` and `/root` are tmpfs.  About 12 MiB of RAM is free for the system
+after the kernel and the radio firmware's share.
 
 Not supported yet:
 
 * SMP: the second hart runs the radio firmware
 * Wi-Fi access point mode, and Bluetooth LE from NetBSD (its stack is
   BR/EDR only)
-* writing to the flash
 * USB device (gadget) mode
+* CAN FD frames (NetBSD's CAN sockets are classic CAN; FD frames on the
+  bus are counted and dropped)
+* UHS-I SD speeds, light sleep, I2S codecs that need setting up over I2C
+* the LP I2C controller, I2C target mode, LEDC fades, MCPWM dead time,
+  capture and fault inputs
 
 ```
 ESP-ROM:esp32s31-20251218
-load:0x2f040000,len:0x94a4
+load:0x2f040000,len:0x94ac
 U-Boot SPL 2024.07-gb2ec9ae2
 OpenSBI: ESP32-S31 firmware active
 U-Boot 2024.07-gb2ec9ae2
 Starting kernel ...
 esp32s31-loader: copying NetBSD kernel to PSRAM
-[   1.0000000] NetBSD 11.99.9 (ESP32S31) #22
-[   1.0000000] total memory = 13044 KB
+[   1.0000000] NetBSD 11.99.9 (ESP32S31) #44
+[   1.0000000] total memory = 12624 KB
 [   1.0000000] cpu0: FPU: single precision (F), eager (FS=Off does not trap) context switching
 [   1.0000000] espclic0 at simplebus1: ESP32-S31 CLIC (S-mode ids 16-47)
-[   1.0000000] espintmtx0 at simplebus1: ESP32-S31 interrupt matrix
 [   1.0000000] espgpio0 at simplebus1: ESP32-S31 GPIO, 62 pins (11 reserved)
 [   1.0000000] espsystimer0 at simplebus1: ESP32-S31 system timer, 16.000 MHz, intmtx source 33
+[   1.0000000] espi2s0 at simplebus1: I2S0, DMA channels 0
 [   1.0000000] espuart0 at simplebus1: ESP32 UART, console
+[   1.0000000] espuart1 at simplebus1: ESP32 UART
+[   1.0000000] espcrypto0 at simplebus1: AES ok, SHA ok, RSA ok
+[   1.0000000] espledc0 at simplebus1: LED PWM controller 0, 8 channels, 40 MHz
+[   1.0000000] espmcpwm0 at simplebus1: motor control PWM 0, 6 channels, 40 MHz
+[   1.0000000] espcmpr0 at simplebus1: analog comparator, GPIO37-40
+[   1.0000000] espwdt0 at simplebus1: watchdog (timer group 1)
+[   1.0000000] espi2c0 at simplebus1: I2C controller, 100 kHz
+[   1.0000000] espspi0 at simplebus1: SPI master, 4 chip selects
 [   1.0000000] esptrng0 at simplebus1: ESP32-S31 TRNG
 [   1.0000000] espxiproot0 at simplebus1: 4096 KB file system in flash
+[   1.0000000] espnor0 at simplebus1: SPI flash (ID c8 40 18), 1024 KB at 0x200000
 [   1.0000000] espcp0 at simplebus1: radio co-processor (hart 1)
 [   1.0000000] awge0: Ethernet address 24:0a:c4:00:00:04
 [   1.0000000] espusj0 at simplebus1: ESP32-S31 USB-Serial/JTAG
 [   1.0000000] dwcmmc0 at simplebus1: DesignWare SD/MMC
 [   1.0000000] dwctwo0 at simplebus1: DesignWare USB2 OTG
-[   1.2596627] espcp0: espcp v0.3.0, 1169 KiB, 1024 KiB PSRAM at 0x503a7000
-[   1.2996404] espcp0: espcp v0.3.0, ESP-IDF ab95e707-dirty running, interrupting on intmtx source 67
-[   1.2996404] espwifi0 at espcp0: Wi-Fi station, address 24:0a:c4:00:00:01
-[   1.2996404] espbt0 at espcp0: Bluetooth BR/EDR + LE controller, address 24:0a:c4:00:00:02
-[   1.2996404] root on md0a dumps on md0b
+[   1.0000000] audio0 at ausoc0: playback, capture, full duplex
+[   1.2796629] espcp0: espcp v0.4.0, 1180 KiB, 1024 KiB PSRAM at 0x5041a000
+[   1.2996163] espcp0: espcp v0.4.0, ESP-IDF ab95e707-dirty running, interrupting on intmtx source 67
+[   1.2996163] espwifi0 at espcp0: Wi-Fi station, address 24:0a:c4:00:00:01
+[   1.2996163] espbt0 at espcp0: Bluetooth BR/EDR + LE controller, address 24:0a:c4:00:00:02
+[   1.2996163] espsensor0 at espcp0: temperature sensor, ADC1/ADC2
+[   1.3096167] espcp0: CPU clock 320 MHz (320 160 80)
+[   1.3096167] root on md0a dumps on md0b
 Starting NetBSD on the Espressif ESP32-S31
+Making a file system for /persist on espnor0
 
 NetBSD/riscv (esp32s31) (console)
 
 login:
 ```
 
-(This log is from esp-emulator, which runs Espressif's mask ROM.)
+(This log is from esp-emulator, which runs Espressif's mask ROM,
+trimmed.)
 
 ## Flashing a board
 
@@ -134,10 +172,16 @@ macOS.  To make the USB port the console instead, set
 the extra login prompt.  Log in as `root` (no password).
 
 The root file system is read-only, and `/tmp`, `/var` and `/root` are in
-memory, so changes are lost at reset.  Plug the Ethernet port into a
-network with a DHCP server, or join a Wi-Fi network, and the board
-configures itself.  It then sets its clock from the DHCP server's NTP
-servers, `pool.ntp.org` or the router.
+memory, so changes there are lost at reset.  `/etc` and `/persist` are
+kept in flash: the first boot makes a file system on the partition at
+0x200000 (`espnor0`), mounts it on `/persist` and puts `/persist/etc`
+over `/etc`, so `passwd`, `/etc/espwifi.conf` and the like stick.  To
+start afresh, erase that MiB (`esptool erase-region 0x200000 0x100000`)
+and the next boot makes a new one.  Plug the
+Ethernet port into a network with a DHCP server, or join a Wi-Fi
+network, and the board configures itself.  It then sets its clock from
+the DHCP server's NTP servers, `pool.ntp.org` or the router, and the RTC
+timer keeps it across resets.
 
 The image uses the flash layout of Espressif's Linux BSP, with the root
 file system after the kernel, so it replaces whatever was there:
@@ -146,6 +190,7 @@ file system after the kernel, so it replaces whatever was there:
 |---|---|
 | `0x002000` | U-Boot SPL (ESP image, DIO/80 MHz) |
 | `0x100000` | `u-boot.itb`: OpenSBI `fw_dynamic` + U-Boot |
+| `0x200000` | `/persist` (and `/etc`): FFS, made at first boot (1 MiB) |
 | `0x300000` | device tree (`esp32s31.dts`) |
 | `0x500000` | `netbsd-esp32s31.img`: loader + kernel (at most 4 MiB) |
 | `0x900000` | root file system, FFS (at most 4 MiB) |
@@ -189,10 +234,37 @@ Bluetooth is `espbt0` in NetBSD's Bluetooth stack:
 The controller is off until `btconfig ... up`.  `bthcid` runs from boot
 and answers pairing requests: give it a PIN for a device with
 `btpin -d espbt0 -a 11:22:33:44:55:66 -p 1234`.  Link keys live in
-`/var/db/bthcid.keys`, so they are forgotten at reset.
+`/var/db/bthcid.keys`, on the persistent partition.
 
 The firmware's log is in `dmesg` (lines starting `espcp0:`), and
 `vmstat -e | grep espcp` counts its messages.
+
+## Peripherals
+
+Pins: every peripheral signal that goes through the GPIO matrix is named
+(`sysctl hw.espgpio0.functions` lists them), and `sysctl -w
+hw.espgpio0.pinN=NAME` gives pin N that signal (`gpio` makes it a plain
+GPIO again, `analog` disconnects it for the ADC and comparator).  The
+device tree can do the same with `espressif,pins` and
+`espressif,functions` in a pin configuration.  On the devkit, Ethernet
+has GPIO5-19 and the SD slot GPIO20-25; the examples below use free
+pins.
+
+| | |
+|---|---|
+| UART1-3 | `sysctl -w hw.espgpio0.pin2=uart1_txd hw.espgpio0.pin3=uart1_rxd`, then `cu -l /dev/ttyEU1 -s 115200` |
+| I2C | `sysctl -w hw.espgpio0.pin0=i2c0_scl hw.espgpio0.pin1=i2c0_sda`; `i2cscan iic0`, `i2cxfer -f /dev/iic0 0x50 w 0 r 16` (writes a 0, reads 16 bytes) |
+| SPI | `spi2_sck`, `spi2_mosi`, `spi2_miso`, `spi2_cs0` to, say, GPIO41-44; `spixfer -f /dev/spi0 -r 4 0x9f` (sends 0x9f, reads 4 bytes) |
+| CAN | `twai0_tx`/`twai0_rx` to a transceiver (GPIO45/46, say); `sysctl -w hw.esptwai0.bitrate=250000` (or `canconfig`), `ifconfig esptwai0 up`, `candump esptwai0`, `cansend esptwai0 123#deadbeef` |
+| Audio | `i2s0_bck`, `i2s0_ws`, `i2s0_dout` (and `i2s0_din`) to an I2S DAC (PCM5102A, MAX98357A, ...) or microphone (GPIO47-50, say); `audioplay file.wav`, `audiorecord -t 5 -F wav out.wav` |
+| PWM | `sysctl -w hw.espledc0.ch0.pin=4 hw.espledc0.ch0.period=1000000 hw.espledc0.ch0.duty=250000` (1 kHz, 25 %; ns); `sysctl hw.espledc0.ch0.actual`; `espmcpwm0-3` the same, outputs in pairs sharing a period |
+| Sensors | `envstat`: the chip's temperature; `sysctl -w hw.espsensor0.adc_channels=0x3` adds ADC1 channels 0 and 1 (GPIO42/43), in mV |
+| Comparator | `sysctl -w hw.espcmpr0.ch1=37 hw.espcmpr0.reference=5` compares GPIO37 with 50 % of VDD; `envstat -d espcmpr0` |
+| Crypto | used by the kernel's AES automatically; `/dev/crypto` for SHA-1, HMAC-SHA1/256/384/512 and RSA modexp; `vmstat -e \| grep espcrypto` |
+| Watchdog | `wdogctl -k -p 30 espwdt0` (the kernel tickles it), or `-u` (a `wdogctl` process does), or `-e` (you do, with `wdogctl -t`) |
+| CPU clock | `sysctl -w machdep.cpufreq.cpu0.target=80` (320, 160 or 80 MHz, for both harts) |
+| Power-off | `halt -p` puts the chip into deep sleep; with `sysctl -w hw.espcp0.poweroff_wake_secs=600` it boots again 10 minutes later, with `hw.espcp0.poweroff_wake_gpios=0x1` when GPIO0 goes low |
+| SD slot 1 | in `esp32s31.dts`'s `mmc` node: `espressif,slot = <1>;` and `pinctrl-0 = <&sdmmc1_pins>;` (GPIO35-40, which are strapping pins) |
 
 ## Building
 
@@ -245,14 +317,15 @@ after it takes a few minutes.
 
 ```sh
 # QEMU model
-test/boot-test.py --reboots 2 --vi --fptest --net --usb --usj --gpio --sd
+test/boot-test.py --reboots 2 --vi --fptest --net --usb --usj --gpio --sd --uart --hw
 test/boot-test.py --wifi --bt --bumble-python .venv-bumble/bin/python
+test/boot-test.py --persist --power
 test/boot-test.py --machopts ",asid=off" --net --usb   # a core without ASIDs
 test/rx-flood.py                                       # UART RX stress
 
 # Espressif's esp-emulator (real mask ROM)
-test/boot-test.py --esp-emu ~/.local/bin/esp-emu --reboots 1 --vi --fptest --net --gpio
-test/boot-test.py --esp-emu ~/.local/bin/esp-emu --wifi
+test/boot-test.py --esp-emu ~/.local/bin/esp-emu --reboots 1 --vi --fptest --net --gpio --persist
+test/boot-test.py --esp-emu ~/.local/bin/esp-emu --wifi --crypto --hw
 ```
 
 `--wifi` downloads a file over HTTP from the host: serve one first with
@@ -261,7 +334,9 @@ test/boot-test.py --esp-emu ~/.local/bin/esp-emu --wifi
 8088`.  `--bt` needs [Bumble](https://github.com/google/bumble)
 (`python3 -m venv .venv-bumble && .venv-bumble/bin/pip install bumble`):
 `test/bt-peer.py` serves a virtual controller and a second device with a
-serial port service to talk to.
+serial port service to talk to.  `--crypto` fetches `test/cryptotest`
+the same way: build it with `test/cryptotest/build.sh
+/tmp/httproot/cryptotest`.
 
 `boot-test.py` boots the image, logs in, runs commands (pass your own as
 arguments), then halts.  Options add checks:
@@ -276,6 +351,11 @@ arguments), then halts.  Options add checks:
 | `--sd` | formats, writes and reads back a blank SD card (QEMU only) |
 | `--wifi` | scans, joins the emulator's access point (WPA2/WPA3), DHCP, ping, HTTP |
 | `--bt` | Bluetooth up, inquiry, SDP and RFCOMM against a Bumble peer (QEMU only) |
+| `--uart` | UART1 through an echoing peer on a TCP socket (QEMU only) |
+| `--hw` | sensors, ADC, comparator, RTC across a reboot, audio record and play, CAN between the two controllers, PWM, then the watchdog's reset (the RTC, audio, CAN and comparator parts in QEMU only) |
+| `--persist` | writes `/etc` and `/persist`, reboots and checks they're still there |
+| `--power` | changes the CPU clock, then powers off into deep sleep with a 5-second wake-up and logs in again |
+| `--crypto` | the AES implementation in use, `test/cryptotest` through `/dev/crypto`, and that the hardware did the work (esp-emulator: QEMU has no crypto engines) |
 | `--vi` | edits a file with `vi` over the console |
 | `--reboots N` | warm-reboots N times |
 
@@ -309,9 +389,17 @@ firmware use:
 * the USB OTG controller: QEMU's dwc2 host model, as on the Raspberry Pi
 * the USB-Serial/JTAG port and the GPIO registers
 * the SD/MMC host: a DesignWare MSHC model
+* UART1-3, the timer groups (watchdog, slow clock calibration), the RTC
+  timer and LP_SYS (which survive a reset), the IO_MUX, and the flash's
+  SPI1 port (writes reach the image file with `flash-writeback=on`)
+* the CAN controllers: QEMU's CTU CAN FD core, both on one CAN bus
+  (`/machine/canbus`, which `can-host-socketcan` can join to the host's)
+* I2S and the AHB GDMA, at the sample rate (playback is dropped, capture
+  is a ramp), the analog comparator with made-up pad voltages, and the
+  PWM blocks' registers
 * hart 1's radio firmware: a stand-in that speaks its side of the
-  message rings, with an access point on a QEMU network backend and HCI
-  to a chardev
+  message rings, with an access point on a QEMU network backend, HCI to
+  a chardev, sensor readings, the CPU clock and deep sleep
 
 QEMU emulates the SPL step itself: it parses `u-boot.itb` and starts
 OpenSBI the way the SPL would.  esp-emulator runs the real mask ROM and
@@ -335,9 +423,15 @@ radio firmware.
   * the Ethernet glue for `awge` (`esp_gmac.c`)
   * the USB PHY (`espusbphy`); the controller is the stock `dwctwo`
   * the SD host glue for the stock `dwcmmc`
-  * the radio co-processor (`espcp`) and its Wi-Fi (`espwifi`) and
-    Bluetooth (`espbt`) drivers, and `espwifictl`
-  * the flash root file system (`espxiproot`)
+  * the radio co-processor (`espcp`) and its Wi-Fi (`espwifi`),
+    Bluetooth (`espbt`) and sensor (`espsensor`) drivers, `espwifictl`,
+    and the CPU clock and deep-sleep power-off
+  * the flash root file system (`espxiproot`) and the writable flash
+    partition (`espnor`)
+  * UART1-3 (`espuart`), I2C (`espi2c`), SPI (`espspi`), CAN
+    (`esptwai`), I2S (`espi2s`), PWM (`espledc`, `espmcpwm`), the
+    watchdog (`espwdt`), the RTC timer (`esprtc`), the comparator
+    (`espcmpr`) and the crypto engines (`espcrypto`)
   * the FDT platform code and `loader/loader.S`.  The loader turns the
     kernel into a RISC-V `Image` that U-Boot can `booti` straight from
     the flash XIP window, then copies it to PSRAM.
@@ -350,7 +444,10 @@ radio firmware.
   * FPU support for cores with F but not D
   * D-cache hooks for non-coherent DMA
   * a few driver options (dwc_gmac burst modes and enhanced descriptors,
-    the dwc2 reset)
+    the dwc2 reset, dwc_mmc cards other than 0)
+  * an opencrypto fix (`crypto_kregister` left a spin lock held), more
+    codecs for `spdiftx` (I2S DACs and microphones), and riscv power-off
+    through an FDT power controller
 
   To check they don't regress riscv64, `GENERIC64` was built and booted
   on QEMU's `virt` machine (2 harts) up to the root device prompt.
@@ -390,6 +487,20 @@ Espressif's source code, not against hardware:
 * **TRNG.**  Entropy is credited at 1 bit per byte, after health tests.
 * **Console.**  The UART divisor is left as the ROM and U-Boot set it
   (115200).
+* **Flash writes.**  `/persist` is written through SPI1 while code runs
+  from flash through SPI0, relying on the controller suspending a program
+  or erase whenever the cache needs the flash (as ESP-IDF configures it).
+  esp-emulator and QEMU don't model that interplay.
+* **Clocks for the new peripherals.**  Everything counts the 40 MHz XTAL
+  (UART, I2C, SPI, PWM, CAN, I2S MCLK through the fractional divider), so
+  nothing depends on PLLs NetBSD doesn't manage, but the dividers have
+  only been checked against Espressif's drivers and the emulators.
+* **I2S and the GDMA.**  The audio buffers are in PSRAM and synced with
+  cache maintenance; the emulators don't model the cache.
+* **CPU clock and deep sleep.**  Clock changes and deep sleep are done by
+  ESP-IDF on hart 1 as its own power management does them; deep sleep is
+  entered with hart 0 still running (waiting), which ESP-IDF doesn't do
+  itself.
 * **Radio firmware.**  Hart 1 starts in M-mode with its PMP and PMA
   registers as reset left them, and the firmware skips the chip set-up
   ESP-IDF normally does at boot: clocks (it runs at whatever U-Boot set),
