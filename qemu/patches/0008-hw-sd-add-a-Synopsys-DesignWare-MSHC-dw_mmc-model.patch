@@ -1,0 +1,640 @@
+From 03b440ab160045004dbbc79e641c55c731b400ad Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 07:46:57 -0400
+Subject: [PATCH 8/9] hw/sd: add a Synopsys DesignWare MSHC (dw_mmc) model
+
+One card slot on an SD bus, with data moved by the internal DMA
+controller (4-word descriptors, ring or chain mode); the FIFO/PIO path
+is not modelled.  Commands and transfers complete synchronously, with
+auto-stop (CMD12) support and the usual raw/masked and IDMAC interrupt
+status.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/sd/Kconfig           |   4 +
+ hw/sd/dw_mshc.c         | 512 ++++++++++++++++++++++++++++++++++++++++
+ hw/sd/meson.build       |   1 +
+ include/hw/sd/dw_mshc.h |  65 +++++
+ 4 files changed, 582 insertions(+)
+ create mode 100644 hw/sd/dw_mshc.c
+ create mode 100644 include/hw/sd/dw_mshc.h
+
+diff --git a/hw/sd/Kconfig b/hw/sd/Kconfig
+index 633b9af..fec575b 100644
+--- a/hw/sd/Kconfig
++++ b/hw/sd/Kconfig
+@@ -7,6 +7,10 @@ config SSI_SD
+     depends on SSI
+     select SD
+ 
++config DW_MSHC
++    bool
++    select SD
++
+ config SD
+     bool
+ 
+diff --git a/hw/sd/dw_mshc.c b/hw/sd/dw_mshc.c
+new file mode 100644
+index 0000000..e5884bf
+--- /dev/null
++++ b/hw/sd/dw_mshc.c
+@@ -0,0 +1,512 @@
++/*
++ * Synopsys DesignWare Mobile Storage Host Controller (DW MSHC, "dw_mmc")
++ *
++ * One card slot, commands on the SD bus, data through the internal DMA
++ * controller (IDMAC) with 4-word descriptors in ring or chain mode.  The
++ * FIFO/PIO path is not modelled.  Transfers complete synchronously when
++ * the command is issued.
++ *
++ * Copyright (c) 2026 The NetBSD Foundation, Inc.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qapi/error.h"
++#include "system/dma.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/irq.h"
++#include "hw/sd/dw_mshc.h"
++#include "migration/vmstate.h"
++
++/* Registers */
++#define R_CTRL          0x00
++#define  CTRL_CONTROLLER_RESET  (1u << 0)
++#define  CTRL_FIFO_RESET        (1u << 1)
++#define  CTRL_DMA_RESET         (1u << 2)
++#define  CTRL_INT_ENABLE        (1u << 4)
++#define  CTRL_USE_INTERNAL_DMAC (1u << 25)
++#define R_PWREN         0x04
++#define R_CLKDIV        0x08
++#define R_CLKSRC        0x0c
++#define R_CLKENA        0x10
++#define R_TMOUT         0x14
++#define R_CTYPE         0x18
++#define R_BLKSIZ        0x1c
++#define R_BYTCNT        0x20
++#define R_INTMASK       0x24
++#define R_CMDARG        0x28
++#define R_CMD           0x2c
++#define  CMD_INDEX_MASK         0x3fu
++#define  CMD_RESP_EXPECT        (1u << 6)
++#define  CMD_RESP_LONG          (1u << 7)
++#define  CMD_DATA_EXPECTED      (1u << 9)
++#define  CMD_WRITE              (1u << 10)
++#define  CMD_SEND_AUTO_STOP     (1u << 12)
++#define  CMD_UPDATE_CLOCK_ONLY  (1u << 21)
++#define  CMD_START              (1u << 31)
++#define R_RESP0         0x30
++#define R_RESP1         0x34
++#define R_RESP2         0x38
++#define R_RESP3         0x3c
++#define R_MINTSTS       0x40
++#define R_RINTSTS       0x44
++#define  INT_CD                 (1u << 2)   /* command done */
++#define  INT_DTO                (1u << 3)   /* data transfer over */
++#define  INT_RTO                (1u << 8)   /* response timeout */
++#define  INT_DRTO               (1u << 9)   /* data read timeout */
++#define  INT_ACD                (1u << 14)  /* auto command done */
++#define  INT_EBE                (1u << 15)  /* end-bit error */
++#define R_STATUS        0x48
++#define  STATUS_FIFO_EMPTY      (1u << 2)
++#define R_FIFOTH        0x4c
++#define R_CDETECT       0x50
++#define R_WRTPRT        0x54
++#define R_GPIO          0x58
++#define R_TCBCNT        0x5c
++#define R_TBBCNT        0x60
++#define R_DEBNCE        0x64
++#define R_USRID         0x68
++#define R_VERID         0x6c
++#define R_HCON          0x70
++#define R_UHS           0x74
++#define R_RST_N         0x78
++#define R_BMOD          0x80
++#define  BMOD_SWR               (1u << 0)
++#define  BMOD_DE                (1u << 7)
++#define R_PLDMND        0x84
++#define R_DBADDR        0x88
++#define R_IDSTS         0x8c
++#define  IDSTS_TI               (1u << 0)
++#define  IDSTS_RI               (1u << 1)
++#define  IDSTS_DU               (1u << 4)
++#define  IDSTS_NIS              (1u << 8)
++#define  IDSTS_AIS              (1u << 9)
++#define R_IDINTEN       0x90
++#define R_DSCADDR       0x94
++#define R_BUFADDR       0x98
++#define R_CARDTHRCTL    0x100
++#define R_BACKEND_POWER 0x104
++#define R_DATA          0x200
++#define R_VENDOR        0x800
++
++/* IDMAC descriptor */
++#define DES0_DIC        (1u << 1)
++#define DES0_LD         (1u << 2)
++#define DES0_FS         (1u << 3)
++#define DES0_CH         (1u << 4)
++#define DES0_ER         (1u << 5)
++#define DES0_OWN        (1u << 31)
++
++#define MAX_DESCRIPTORS 4096
++
++static void dw_mshc_update_irq(DWMSHCState *s)
++{
++    bool level = ((s->rintsts & s->intmask) != 0 &&
++                  (s->ctrl & CTRL_INT_ENABLE) != 0) ||
++                 (s->idsts & s->idinten & 0x3ff) != 0;
++
++    qemu_set_irq(s->irq, level);
++}
++
++static bool dw_mshc_command(DWMSHCState *s, uint32_t index, uint32_t arg,
++                            uint32_t flags)
++{
++    SDRequest req = { .cmd = index, .arg = arg };
++    uint8_t resp[16];
++    size_t rlen;
++
++    if (!sdbus_get_inserted(&s->sdbus)) {
++        s->rintsts |= INT_RTO | INT_CD;
++        return false;
++    }
++
++    rlen = sdbus_do_command(&s->sdbus, &req, resp, sizeof(resp));
++    if (flags & CMD_RESP_EXPECT) {
++        if ((flags & CMD_RESP_LONG) && rlen == 16) {
++            s->resp[0] = ldl_be_p(&resp[12]);
++            s->resp[1] = ldl_be_p(&resp[8]);
++            s->resp[2] = ldl_be_p(&resp[4]);
++            s->resp[3] = ldl_be_p(&resp[0]);
++        } else if (!(flags & CMD_RESP_LONG) && rlen == 4) {
++            s->resp[0] = ldl_be_p(&resp[0]);
++            s->resp[1] = s->resp[2] = s->resp[3] = 0;
++        } else {
++            s->rintsts |= INT_RTO | INT_CD;
++            return false;
++        }
++    }
++    s->rintsts |= INT_CD;
++    return true;
++}
++
++/* Move BYTCNT bytes between the card and the IDMAC's buffers. */
++static void dw_mshc_dma(DWMSHCState *s, bool write)
++{
++    uint32_t left = s->bytcnt;
++    uint32_t addr = s->dbaddr;
++    uint8_t buf[4096];
++
++    for (int n = 0; left > 0 && n < MAX_DESCRIPTORS; n++) {
++        uint32_t d[4];
++        uint32_t len;
++
++        s->dscaddr = addr;
++        if (dma_memory_read(&s->dma_as, addr, d, sizeof(d),
++                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++            s->idsts |= IDSTS_AIS | (1u << 2);  /* fatal bus error */
++            return;
++        }
++        for (int i = 0; i < 4; i++) {
++            d[i] = le32_to_cpu(d[i]);
++        }
++        if (!(d[0] & DES0_OWN)) {
++            s->idsts |= IDSTS_DU | IDSTS_AIS;
++            return;
++        }
++
++        for (int b = 0; b < 2 && left > 0; b++) {
++            uint32_t baddr = b == 0 ? d[2] : d[3];
++
++            len = b == 0 ? (d[1] & 0x1fff) : ((d[1] >> 13) & 0x1fff);
++            if (b == 1 && (d[0] & DES0_CH)) {
++                break;          /* DES3 is the next descriptor */
++            }
++            len = MIN(len, left);
++            s->bufaddr = baddr;
++            while (len > 0) {
++                uint32_t chunk = MIN(len, sizeof(buf));
++
++                if (write) {
++                    dma_memory_read(&s->dma_as, baddr, buf, chunk,
++                                    MEMTXATTRS_UNSPECIFIED);
++                    sdbus_write_data(&s->sdbus, buf, chunk);
++                } else {
++                    if (!sdbus_data_ready(&s->sdbus)) {
++                        s->rintsts |= INT_DRTO;
++                        return;
++                    }
++                    sdbus_read_data(&s->sdbus, buf, chunk);
++                    dma_memory_write(&s->dma_as, baddr, buf, chunk,
++                                     MEMTXATTRS_UNSPECIFIED);
++                }
++                baddr += chunk;
++                len -= chunk;
++                left -= chunk;
++                s->tcbcnt += chunk;
++            }
++        }
++
++        d[0] = cpu_to_le32(d[0] & ~DES0_OWN);
++        dma_memory_write(&s->dma_as, addr, &d[0], sizeof(d[0]),
++                         MEMTXATTRS_UNSPECIFIED);
++        d[0] = le32_to_cpu(d[0]);
++
++        if (d[0] & DES0_LD) {
++            break;
++        }
++        if (d[0] & DES0_CH) {
++            addr = d[3];
++        } else if (d[0] & DES0_ER) {
++            addr = s->dbaddr;
++        } else {
++            addr += 16;
++        }
++    }
++
++    s->idsts |= (write ? IDSTS_TI : IDSTS_RI) | IDSTS_NIS;
++}
++
++static void dw_mshc_start(DWMSHCState *s)
++{
++    uint32_t cmd = s->cmd;
++
++    s->cmd &= ~CMD_START;
++    if (cmd & CMD_UPDATE_CLOCK_ONLY) {
++        return;
++    }
++
++    s->tcbcnt = 0;
++    if (!dw_mshc_command(s, cmd & CMD_INDEX_MASK, s->cmdarg, cmd)) {
++        return;
++    }
++
++    if (cmd & CMD_DATA_EXPECTED) {
++        if ((s->ctrl & CTRL_USE_INTERNAL_DMAC) && (s->bmod & BMOD_DE)) {
++            dw_mshc_dma(s, cmd & CMD_WRITE);
++        } else {
++            qemu_log_mask(LOG_UNIMP, "dw-mshc: PIO transfers not supported\n");
++            s->rintsts |= INT_DRTO;
++            return;
++        }
++        s->rintsts |= INT_DTO;
++        if (cmd & CMD_SEND_AUTO_STOP) {
++            uint32_t saved[4];
++
++            memcpy(saved, s->resp, sizeof(saved));
++            dw_mshc_command(s, 12, 0, CMD_RESP_EXPECT);
++            /* The auto-stop response goes to RESP1; keep the command's. */
++            s->resp[1] = s->resp[0];
++            s->resp[0] = saved[0];
++            s->rintsts |= INT_ACD;
++        }
++    }
++}
++
++static uint64_t dw_mshc_read(void *opaque, hwaddr addr, unsigned size)
++{
++    DWMSHCState *s = opaque;
++
++    switch (addr) {
++    case R_CTRL:        return s->ctrl;
++    case R_PWREN:       return s->pwren;
++    case R_CLKDIV:      return s->clkdiv;
++    case R_CLKSRC:      return s->clksrc;
++    case R_CLKENA:      return s->clkena;
++    case R_TMOUT:       return s->tmout;
++    case R_CTYPE:       return s->ctype;
++    case R_BLKSIZ:      return s->blksiz;
++    case R_BYTCNT:      return s->bytcnt;
++    case R_INTMASK:     return s->intmask;
++    case R_CMDARG:      return s->cmdarg;
++    case R_CMD:         return s->cmd;
++    case R_RESP0:       return s->resp[0];
++    case R_RESP1:       return s->resp[1];
++    case R_RESP2:       return s->resp[2];
++    case R_RESP3:       return s->resp[3];
++    case R_MINTSTS:     return s->rintsts & s->intmask;
++    case R_RINTSTS:     return s->rintsts;
++    case R_STATUS:      return STATUS_FIFO_EMPTY;
++    case R_FIFOTH:      return s->fifoth;
++    case R_CDETECT:     return sdbus_get_inserted(&s->sdbus) ? 0 : 1;
++    case R_WRTPRT:      return sdbus_get_readonly(&s->sdbus) ? 1 : 0;
++    case R_TCBCNT:      return s->tcbcnt;
++    case R_TBBCNT:      return 0;
++    case R_DEBNCE:      return s->debnce;
++    case R_USRID:       return s->usrid;
++    case R_VERID:       return s->verid;
++    case R_HCON:        return (1u << 1) | (1u << 7);  /* 2 cards, 32-bit */
++    case R_UHS:         return s->uhs;
++    case R_RST_N:       return s->rst_n;
++    case R_BMOD:        return s->bmod;
++    case R_DBADDR:      return s->dbaddr;
++    case R_IDSTS:       return s->idsts;
++    case R_IDINTEN:     return s->idinten;
++    case R_DSCADDR:     return s->dscaddr;
++    case R_BUFADDR:     return s->bufaddr;
++    case R_CARDTHRCTL:  return s->cardthrctl;
++    case R_BACKEND_POWER: return s->backend_power;
++    default:
++        if (addr >= R_VENDOR && addr < R_VENDOR + sizeof(s->vendor)) {
++            return s->vendor[(addr - R_VENDOR) / 4];
++        }
++        qemu_log_mask(LOG_UNIMP, "dw-mshc: read of 0x%" HWADDR_PRIx "\n",
++                      addr);
++        return 0;
++    }
++}
++
++static void dw_mshc_write(void *opaque, hwaddr addr, uint64_t val,
++                          unsigned size)
++{
++    DWMSHCState *s = opaque;
++
++    switch (addr) {
++    case R_CTRL:
++        /* The reset bits complete at once and clear themselves. */
++        if (val & CTRL_CONTROLLER_RESET) {
++            s->rintsts = 0;
++        }
++        s->ctrl = val & ~(CTRL_CONTROLLER_RESET | CTRL_FIFO_RESET |
++                          CTRL_DMA_RESET);
++        break;
++    case R_PWREN:       s->pwren = val; break;
++    case R_CLKDIV:      s->clkdiv = val; break;
++    case R_CLKSRC:      s->clksrc = val; break;
++    case R_CLKENA:      s->clkena = val; break;
++    case R_TMOUT:       s->tmout = val; break;
++    case R_CTYPE:       s->ctype = val; break;
++    case R_BLKSIZ:      s->blksiz = val; break;
++    case R_BYTCNT:      s->bytcnt = val; break;
++    case R_INTMASK:     s->intmask = val; break;
++    case R_CMDARG:      s->cmdarg = val; break;
++    case R_CMD:
++        s->cmd = val;
++        if (val & CMD_START) {
++            dw_mshc_start(s);
++        }
++        break;
++    case R_RINTSTS:     s->rintsts &= ~val; break;
++    case R_FIFOTH:      s->fifoth = val; break;
++    case R_DEBNCE:      s->debnce = val; break;
++    case R_USRID:       s->usrid = val; break;
++    case R_UHS:         s->uhs = val; break;
++    case R_RST_N:       s->rst_n = val; break;
++    case R_BMOD:
++        if (val & BMOD_SWR) {
++            s->idsts = 0;
++        }
++        s->bmod = val & ~BMOD_SWR;
++        break;
++    case R_PLDMND:      break;      /* transfers already happened */
++    case R_DBADDR:      s->dbaddr = val; break;
++    case R_IDSTS:       s->idsts &= ~(val & 0x3ff); break;
++    case R_IDINTEN:     s->idinten = val; break;
++    case R_CARDTHRCTL:  s->cardthrctl = val; break;
++    case R_BACKEND_POWER: s->backend_power = val; break;
++    default:
++        if (addr >= R_VENDOR && addr < R_VENDOR + sizeof(s->vendor)) {
++            s->vendor[(addr - R_VENDOR) / 4] = val;
++            break;
++        }
++        qemu_log_mask(LOG_UNIMP, "dw-mshc: write of 0x%" HWADDR_PRIx "\n",
++                      addr);
++        break;
++    }
++
++    /* Any write may have changed status or masks. */
++    if (s->idsts & 0xff) {
++        s->idsts |= IDSTS_NIS;
++    }
++    dw_mshc_update_irq(s);
++}
++
++static const MemoryRegionOps dw_mshc_ops = {
++    .read = dw_mshc_read,
++    .write = dw_mshc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++    .impl = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void dw_mshc_set_inserted(DeviceState *dev, bool inserted)
++{
++    DWMSHCState *s = DW_MSHC(dev);
++
++    s->rintsts |= 1u;   /* card detect */
++    dw_mshc_update_irq(s);
++}
++
++static void dw_mshc_reset(DeviceState *dev)
++{
++    DWMSHCState *s = DW_MSHC(dev);
++
++    s->ctrl = 0;
++    s->pwren = 0;
++    s->clkdiv = 0;
++    s->clksrc = 0;
++    s->clkena = 0;
++    s->tmout = 0xffffff40;
++    s->ctype = 0;
++    s->blksiz = 0x200;
++    s->bytcnt = 0x200;
++    s->intmask = 0;
++    s->cmdarg = 0;
++    s->cmd = 0;
++    memset(s->resp, 0, sizeof(s->resp));
++    s->rintsts = 0;
++    s->fifoth = (s->fifo_depth - 1) << 16;
++    s->tcbcnt = 0;
++    s->debnce = 0xffffff;
++    s->usrid = 0;
++    s->uhs = 0;
++    s->rst_n = 1;
++    s->bmod = 0;
++    s->dbaddr = 0;
++    s->idsts = 0;
++    s->idinten = 0;
++    s->dscaddr = 0;
++    s->bufaddr = 0;
++    s->cardthrctl = 0;
++    s->backend_power = 0;
++    memset(s->vendor, 0, sizeof(s->vendor));
++}
++
++static void dw_mshc_init(Object *obj)
++{
++    DWMSHCState *s = DW_MSHC(obj);
++
++    qbus_init(&s->sdbus, sizeof(s->sdbus), TYPE_DW_MSHC_BUS, DEVICE(s),
++              "sd-bus");
++    memory_region_init_io(&s->iomem, obj, &dw_mshc_ops, s, TYPE_DW_MSHC,
++                          DW_MSHC_REG_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
++}
++
++static void dw_mshc_realize(DeviceState *dev, Error **errp)
++{
++    DWMSHCState *s = DW_MSHC(dev);
++
++    if (!s->dma_mr) {
++        error_setg(errp, TYPE_DW_MSHC " 'dma-memory' link not set");
++        return;
++    }
++    if (s->fifo_depth < 2 || s->fifo_depth > 4096) {
++        error_setg(errp, TYPE_DW_MSHC " 'fifo-depth' out of range");
++        return;
++    }
++    address_space_init(&s->dma_as, s->dma_mr, "dw-mshc-dma");
++}
++
++static const VMStateDescription vmstate_dw_mshc = {
++    .name = TYPE_DW_MSHC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(ctrl, DWMSHCState),
++        VMSTATE_UINT32(cmd, DWMSHCState),
++        VMSTATE_UINT32_ARRAY(resp, DWMSHCState, 4),
++        VMSTATE_UINT32(rintsts, DWMSHCState),
++        VMSTATE_UINT32(intmask, DWMSHCState),
++        VMSTATE_UINT32(idsts, DWMSHCState),
++        VMSTATE_UINT32(idinten, DWMSHCState),
++        VMSTATE_UINT32(bmod, DWMSHCState),
++        VMSTATE_UINT32(dbaddr, DWMSHCState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const Property dw_mshc_properties[] = {
++    DEFINE_PROP_LINK("dma-memory", DWMSHCState, dma_mr, TYPE_MEMORY_REGION,
++                     MemoryRegion *),
++    DEFINE_PROP_UINT32("fifo-depth", DWMSHCState, fifo_depth, 128),
++    DEFINE_PROP_UINT32("verid", DWMSHCState, verid, 0x5432270a),
++};
++
++static void dw_mshc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, dw_mshc_reset);
++    device_class_set_props(dc, dw_mshc_properties);
++    dc->realize = dw_mshc_realize;
++    dc->vmsd = &vmstate_dw_mshc;
++}
++
++static void dw_mshc_bus_class_init(ObjectClass *klass, const void *data)
++{
++    SDBusClass *sbc = SD_BUS_CLASS(klass);
++
++    sbc->set_inserted = dw_mshc_set_inserted;
++}
++
++static const TypeInfo dw_mshc_types[] = {
++    {
++        .name           = TYPE_DW_MSHC,
++        .parent         = TYPE_SYS_BUS_DEVICE,
++        .instance_size  = sizeof(DWMSHCState),
++        .instance_init  = dw_mshc_init,
++        .class_init     = dw_mshc_class_init,
++    },
++    {
++        .name           = TYPE_DW_MSHC_BUS,
++        .parent         = TYPE_SD_BUS,
++        .instance_size  = sizeof(SDBus),
++        .class_init     = dw_mshc_bus_class_init,
++    },
++};
++
++DEFINE_TYPES(dw_mshc_types)
+diff --git a/hw/sd/meson.build b/hw/sd/meson.build
+index b43d45b..0bd90aa 100644
+--- a/hw/sd/meson.build
++++ b/hw/sd/meson.build
+@@ -8,5 +8,6 @@ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_mmc.c'))
+ system_ss.add(when: 'CONFIG_RASPI', if_true: files('bcm2835_sdhost.c'))
+ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_sdhci.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-sdhost.c'))
++system_ss.add(when: 'CONFIG_DW_MSHC', if_true: files('dw_mshc.c'))
+ system_ss.add(when: 'CONFIG_NPCM7XX', if_true: files('npcm7xx_sdhci.c'))
+ system_ss.add(when: 'CONFIG_CADENCE_SDHCI', if_true: files('cadence_sdhci.c'))
+diff --git a/include/hw/sd/dw_mshc.h b/include/hw/sd/dw_mshc.h
+new file mode 100644
+index 0000000..324c3b8
+--- /dev/null
++++ b/include/hw/sd/dw_mshc.h
+@@ -0,0 +1,65 @@
++/*
++ * Synopsys DesignWare Mobile Storage Host Controller (DW MSHC, "dw_mmc")
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_SD_DW_MSHC_H
++#define HW_SD_DW_MSHC_H
++
++#include "hw/core/sysbus.h"
++#include "hw/sd/sd.h"
++#include "qom/object.h"
++
++#define TYPE_DW_MSHC "dw-mshc"
++OBJECT_DECLARE_SIMPLE_TYPE(DWMSHCState, DW_MSHC)
++
++#define TYPE_DW_MSHC_BUS "dw-mshc-bus"
++
++#define DW_MSHC_REG_SIZE    0x1000
++
++struct DWMSHCState {
++    SysBusDevice parent_obj;
++
++    SDBus sdbus;
++    MemoryRegion iomem;
++    MemoryRegion *dma_mr;
++    AddressSpace dma_as;
++    qemu_irq irq;
++
++    /* properties */
++    uint32_t fifo_depth;
++    uint32_t verid;
++
++    uint32_t ctrl;
++    uint32_t pwren;
++    uint32_t clkdiv;
++    uint32_t clksrc;
++    uint32_t clkena;
++    uint32_t tmout;
++    uint32_t ctype;
++    uint32_t blksiz;
++    uint32_t bytcnt;
++    uint32_t intmask;
++    uint32_t cmdarg;
++    uint32_t cmd;
++    uint32_t resp[4];
++    uint32_t rintsts;
++    uint32_t fifoth;
++    uint32_t tcbcnt;
++    uint32_t debnce;
++    uint32_t usrid;
++    uint32_t uhs;
++    uint32_t rst_n;
++    uint32_t bmod;
++    uint32_t dbaddr;
++    uint32_t idsts;
++    uint32_t idinten;
++    uint32_t dscaddr;
++    uint32_t bufaddr;
++    uint32_t cardthrctl;
++    uint32_t backend_power;
++    uint32_t vendor[0x400 / 4];     /* 0x800-0xbff: vendor glue registers */
++};
++
++#endif /* HW_SD_DW_MSHC_H */
+-- 
+2.43.0
+

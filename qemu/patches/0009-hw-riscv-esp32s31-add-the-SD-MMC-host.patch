@@ -1,0 +1,91 @@
+From edc21c70558976f2033ddfc97d857dfefdf0fa89 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 07:46:57 -0400
+Subject: [PATCH 9/9] hw/riscv/esp32s31: add the SD/MMC host
+
+The ESP32-S31's SD host is a DesignWare MSHC at 0x20342000, interrupt
+matrix source 3.  Slot 0 gets the card from -drive if=sd.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/riscv/Kconfig    |  1 +
+ hw/riscv/esp32s31.c | 29 +++++++++++++++++++++++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+index 3b0000f..690e82e 100644
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -77,6 +77,7 @@ config ESP32S31
+     select UNIMP
+     select NPCM_GMAC
+     select USB_DWC2
++    select DW_MSHC
+ 
+ config SHAKTI_C
+     bool
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index 79815d7..dd0acd9 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -40,6 +40,9 @@
+ #include "hw/core/sysbus.h"
+ #include "hw/net/npcm_gmac.h"
+ #include "hw/usb/hcd-dwc2.h"
++#include "hw/sd/dw_mshc.h"
++#include "hw/sd/sd.h"
++#include "system/blockdev.h"
+ #include "net/net.h"
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+@@ -76,6 +79,7 @@ enum {
+     S31_EMAC_BASE       = 0x20350000,
+     S31_USB_BASE        = 0x20300000,
+     S31_USJ_BASE        = 0x20391000, S31_USJ_SIZE    = 0x1000,
++    S31_SDMMC_BASE      = 0x20342000,
+     S31_GPIO_BASE       = 0x20583000, S31_GPIO_SIZE   = 0xe00,
+     S31_INTMTX_BASE     = 0x20585000, S31_INTMTX_SIZE = 0x800,
+     S31_LPAON_BASE      = 0x20701000, S31_LPAON_SIZE  = 0x1000,
+@@ -86,6 +90,7 @@ enum {
+ 
+ #define S31_TIMEBASE_FREQ   320000000
+ #define S31_SRC_USJ         2
++#define S31_SRC_SDIO_HOST   3
+ #define S31_SRC_UART0       9
+ #define S31_SRC_SYSTIMER0   33
+ #define S31_SRC_EMAC        98
+@@ -1170,6 +1175,30 @@ static void esp32s31_machine_init(MachineState *machine)
+                                              S31_SRC_USB_OTGHS));
+     }
+ 
++    /*
++     * SD/MMC host: a DesignWare MSHC.  Slot 0 has the card from
++     * "-drive if=sd" (or an empty socket).
++     */
++    {
++        DeviceState *sdhost = qdev_new(TYPE_DW_MSHC);
++        DriveInfo *di = drive_get(IF_SD, 0, 0);
++        DeviceState *card;
++
++        object_property_set_link(OBJECT(sdhost), "dma-memory",
++                                 OBJECT(sysmem), &error_fatal);
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(sdhost), &error_fatal);
++        sysbus_mmio_map(SYS_BUS_DEVICE(sdhost), 0, S31_SDMMC_BASE);
++        sysbus_connect_irq(SYS_BUS_DEVICE(sdhost), 0,
++                           qemu_allocate_irq(esp32s31_source_irq, s,
++                                             S31_SRC_SDIO_HOST));
++        card = qdev_new(TYPE_SD_CARD);
++        qdev_prop_set_drive_err(card, "drive",
++                                di ? blk_by_legacy_dinfo(di) : NULL,
++                                &error_fatal);
++        qdev_realize_and_unref(card, qdev_get_child_bus(sdhost, "sd-bus"),
++                               &error_fatal);
++    }
++
+     s->st_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, systimer_timer_cb, s);
+ 
+     qemu_chr_fe_init(&s->chr, serial_hd(0), &error_fatal);
+-- 
+2.43.0
+

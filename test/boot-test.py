@@ -5,7 +5,7 @@ serial console and run a few commands.
 
 usage: boot-test.py [--qemu PATH | --esp-emu PATH] [--flash FILE]
                     [--reboots N] [--vi] [--net] [--fptest] [--usb] [--gpio]
-                    [--usj]
+                    [--usj] [--sd]
                     [cmd ...]
 """
 import argparse
@@ -42,6 +42,8 @@ ap.add_argument("--usb", action="store_true",
                      "and an FTDI serial adapter, and check all three")
 ap.add_argument("--usj", action="store_true",
                 help="QEMU only: log in over the USB-Serial/JTAG port")
+ap.add_argument("--sd", action="store_true",
+                help="QEMU only: format, write and read back a blank SD card")
 ap.add_argument("--gpio", action="store_true",
                 help="drive a GPIO pin with gpioctl and read it back")
 ap.add_argument("cmds", nargs="*")
@@ -75,6 +77,13 @@ else:
             usj_port = probe.getsockname()[1]
         argv += ["-serial",
                  f"tcp:127.0.0.1:{usj_port},server=on,wait=off"]
+    if a.sd:
+        # A blank 32 MiB card (QEMU wants a power-of-two size).
+        sdimg = tempfile.NamedTemporaryFile(prefix="s31sd.", suffix=".img",
+                                            delete=False)
+        sdimg.truncate(32 * 1024 * 1024)
+        sdimg.close()
+        argv += ["-drive", f"if=sd,format=raw,file={sdimg.name}"]
     if a.usb:
         # A FAT "stick" made by QEMU from a directory, an Ethernet adapter
         # on its own user-mode network, and an FTDI serial adapter.
@@ -157,6 +166,14 @@ def usj_session():
 if a.usj:
     print(f"usb-serial/jtag login: {'ok' if usj_session() else 'FAILED'}",
           flush=True)
+if a.sd:
+    check("sd card", "newfs_msdos -F 16 /dev/rld0c >/dev/null &&"
+          " mount -t msdos /dev/ld0c /mnt &&"
+          " dd if=/dev/urandom of=/mnt/r bs=64k count=32 2>/dev/null &&"
+          " sha256 -q /mnt/r > /tmp/sd.sum && umount /mnt &&"
+          " mount -t msdos /dev/ld0c /mnt && sha256 -q /mnt/r |"
+          " cmp -s - /tmp/sd.sum && umount /mnt && echo sd-$((6*7))",
+          "sd-42", 300)
 if a.gpio:
     # GPIO4 is free on the dev board.
     check("gpio", "gpioctl -q gpio0 4 set out && gpioctl -q gpio0 4 1 &&"
