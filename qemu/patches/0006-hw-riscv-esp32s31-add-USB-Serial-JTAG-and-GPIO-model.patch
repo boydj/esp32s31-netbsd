@@ -1,7 +1,7 @@
 From 4df73fa04db336edf8f0f3f53708efc3654a1984 Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 00:36:26 -0400
-Subject: [PATCH 06/12] hw/riscv/esp32s31: add USB-Serial/JTAG and GPIO models
+Subject: [PATCH 06/13] hw/riscv/esp32s31: add USB-Serial/JTAG and GPIO models
 
 USB-Serial/JTAG: the serial side of endpoint 1 (the CDC-ACM port) at
 0x20391000, interrupt matrix source 2, on the second serial port.  The

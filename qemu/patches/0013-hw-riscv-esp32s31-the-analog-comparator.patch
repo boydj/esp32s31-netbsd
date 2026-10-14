@@ -1,0 +1,139 @@
+From 2d9057ff69dcd431dd542a9a6010dff28e2b8f26 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 15:55:51 -0400
+Subject: [PATCH 13/13] hw/riscv/esp32s31: the analog comparator
+
+A software start compares the channels' pads (made-up voltages: GPIO37
+1.0 V, GPIO38 2.0 V, GPIO39 0.5 V, GPIO40 1.2 V) against n x 10% of a
+3.3 V VDD or another pad.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/riscv/esp32s31.c | 82 ++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 81 insertions(+), 1 deletion(-)
+
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index 7a41a5b..dcd8231 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -84,6 +84,7 @@ enum {
+     S31_IOMUX_BASE      = 0x20582000, S31_IOMUX_SIZE  = 0x100,
+     S31_LPSYS_BASE      = 0x20700000, S31_LPSYS_SIZE  = 0x1000,
+     S31_RTCTIMER_BASE   = 0x20800000, S31_RTCTIMER_SIZE = 0x1000,
++    S31_ZERODET_BASE    = 0x2039a000, S31_ZERODET_SIZE = 0x400,
+     S31_EMAC_BASE       = 0x20350000,
+     S31_USB_BASE        = 0x20300000,
+     S31_USJ_BASE        = 0x20391000, S31_USJ_SIZE    = 0x1000,
+@@ -118,7 +119,7 @@ struct Esp32s31State {
+     MemoryRegion lpram, hpram, mrom, resetvec, psram, flash;
+     MemoryRegion clic_m_mr, clic_s_mr, intmtx_mr, systimer_mr;
+     MemoryRegion lpaon_mr, trng_mr, usj_mr, gpio_mr, spi1_mr;
+-    MemoryRegion iomux_mr, lpsys_mr, rtctimer_mr;
++    MemoryRegion iomux_mr, lpsys_mr, rtctimer_mr, zerodet_mr;
+ 
+     /* properties */
+     char *flash_file;
+@@ -138,6 +139,7 @@ struct Esp32s31State {
+     uint32_t iomux_regs[S31_IOMUX_SIZE / 4];
+     uint32_t lpsys_regs[S31_LPSYS_SIZE / 4];
+     uint32_t rtc_regs[0x100 / 4];
++    uint32_t zerodet_regs[S31_ZERODET_SIZE / 4];
+ 
+     /* the flash chip, as SPI1 sees it */
+     uint8_t *flash_chip;
+@@ -1177,6 +1179,79 @@ static const MemoryRegionOps rtctimer_ops = {
+     .valid = { .min_access_size = 4, .max_access_size = 4 },
+ };
+ 
++/*
++ * The analog comparator ("zero detect"): the voltages on its four pads
++ * (GPIO37-40) are made up, 1.0, 2.0, 0.5 and 1.2 V, with VDD 3.3 V.
++ * Each software start compares the three channels' pads against the
++ * reference: n x 10% of VDD, or another pad.
++ */
++#define ZD_CONF                 0x00
++#define ZD_CHANNEL_STATUS       0x38
++#define ZD_PAD_CFG              0x3c
++#define  ZD_PAD_DREF(v)         (((v) >> 4) & 7)
++#define  ZD_PAD_MODE_EXT        (1u << 7)
++#define  ZD_PAD_XPD             (1u << 8)
++#define ZD_START                0x40
++
++static const unsigned zerodet_pad_mv[4] = { 1000, 2000, 500, 1200 };
++
++static int zerodet_pad(uint32_t onehot)
++{
++    return onehot != 0 && (onehot & (onehot - 1)) == 0 ? ctz32(onehot) : -1;
++}
++
++static uint64_t zerodet_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    return s->zerodet_regs[addr / 4];
++}
++
++static void zerodet_write(void *opaque, hwaddr addr, uint64_t val,
++                          unsigned size)
++{
++    Esp32s31State *s = opaque;
++    uint32_t conf = s->zerodet_regs[ZD_CONF / 4];
++    uint32_t pad = s->zerodet_regs[ZD_PAD_CFG / 4];
++    uint32_t st = 0;
++    int ref_mv;
++
++    if (addr == ZD_CHANNEL_STATUS) {
++        return;
++    }
++    if (addr != ZD_START) {
++        s->zerodet_regs[addr / 4] = val;
++        return;
++    }
++    if (!(val & 1) || !(pad & ZD_PAD_XPD)) {
++        return;
++    }
++    if (pad & ZD_PAD_MODE_EXT) {
++        int p = zerodet_pad(conf & 0xf);
++
++        ref_mv = p >= 0 ? zerodet_pad_mv[p] : 0;
++    } else {
++        ref_mv = ZD_PAD_DREF(pad) * 330;
++    }
++    /* CH1 is status bit 2 and selector [15:12]; CH3 bit 0 and [7:4]. */
++    for (int c = 0; c < 3; c++) {
++        int p = zerodet_pad((conf >> (12 - 4 * c)) & 0xf);
++
++        if (((conf >> 28) & (1u << c)) && p >= 0 &&
++            (int)zerodet_pad_mv[p] > ref_mv) {
++            st |= 1u << (2 - c);
++        }
++    }
++    s->zerodet_regs[ZD_CHANNEL_STATUS / 4] = st;
++}
++
++static const MemoryRegionOps zerodet_ops = {
++    .read = zerodet_read,
++    .write = zerodet_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
+ /* ------------------------------------------------------- SPI1 (flash) */
+ 
+ /*
+@@ -1625,6 +1700,11 @@ static void esp32s31_machine_init(MachineState *machine)
+     memory_region_init_io(&s->rtctimer_mr, NULL, &rtctimer_ops, s,
+                           "esp32s31.rtc_timer", S31_RTCTIMER_SIZE);
+     memory_region_add_subregion(sysmem, S31_RTCTIMER_BASE, &s->rtctimer_mr);
++    /* reset: CH1 = pad 0, CH2 = pad 1, CH3 = pad 2, VREF = pad 3 */
++    s->zerodet_regs[ZD_CONF / 4] = 0x00501248;
++    memory_region_init_io(&s->zerodet_mr, NULL, &zerodet_ops, s,
++                          "esp32s31.zero_det", S31_ZERODET_SIZE);
++    memory_region_add_subregion(sysmem, S31_ZERODET_BASE, &s->zerodet_mr);
+ 
+     /*
+      * Ethernet: the EMAC is a DesignWare GMAC 3.70a, close enough to the
+-- 
+2.43.0
+

@@ -350,6 +350,13 @@ if a.hw:
           "degC", 60)
     if not a.esp_emu:
         check("adc", "envstat | grep 'ADC2_0'", "1.800", 60)
+        # QEMU's comparator pads: GPIO37 1.0 V, GPIO38 2.0 V, GPIO40 1.2 V.
+        check("comparator", "sysctl -w hw.espcmpr0.ch1=37 hw.espcmpr0.ch2=38"
+              " hw.espcmpr0.reference=2 >/dev/null;"
+              " a=$(envstat -d espcmpr0 | grep -c TRUE);"
+              " sysctl -w hw.espcmpr0.reference=40 >/dev/null;"
+              " b=$(envstat -d espcmpr0 | grep -c TRUE);"
+              " sysctl -n hw.espgpio0.pin37; echo cmpr-$a-$b", "cmpr-2-1")
         # The RTC timer keeps the time of day across a reboot.
         check("rtc set", "date 203001020304.05 >/dev/null; date +%Y", "2030")
         print(f"rtc: login after {relogin():.1f}s", flush=True)

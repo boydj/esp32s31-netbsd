@@ -1,7 +1,7 @@
 From 2d4a74db0bb06e75911b66343be3793355fdd7db Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 09:28:51 -0400
-Subject: [PATCH 10/12] hw/riscv/esp32s31: a stand-in for the Wi-Fi/Bluetooth
+Subject: [PATCH 10/13] hw/riscv/esp32s31: a stand-in for the Wi-Fi/Bluetooth
  co-processor
 
 NetBSD runs Espressif's Wi-Fi and Bluetooth firmware on the second hart
