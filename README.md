@@ -103,11 +103,22 @@ or step by step (`W` selects the work directory, `J` the parallelism):
 | `tools/assemble.sh` | kernel + ramdisk → loader image → `work/out/s31_netbsd_flash.bin` |
 | `tools/build-qemu.sh` | `qemu-system-riscv32` with the `esp32s31` machine |
 
-Host requirements: a POSIX shell, a C/C++ compiler, git, Python 3 with
-`pyelftools`, `pexpect` (tests) and `esptool` 5.x, and U-Boot's usual host
-dependencies (bison, flex, OpenSSL headers).  QEMU needs meson/ninja and
-glib.  If gitlab.com is unreachable, set `QEMU_WRAP_MIRROR=github` for
-QEMU's subprojects.
+Host requirements: a C/C++ compiler, git, GNU make 4 or later, bison,
+flex, swig, OpenSSL headers, Python 3 with `setuptools`, `pyelftools`,
+`esptool` 5.x and `pexpect` (tests), and for QEMU: ninja, pkg-config,
+glib and pixman.  If gitlab.com is unreachable, set
+`QEMU_WRAP_MIRROR=github` for QEMU's subprojects.
+
+On **macOS** (Homebrew), the system `make` is GNU make 3.81, too old for
+U-Boot.  The scripts pick up Homebrew's `gmake` and its keg-only bison,
+flex and OpenSSL automatically:
+
+```sh
+brew install make bison flex swig openssl@3 pkgconf ninja glib pixman
+python3 -m venv .venv && . .venv/bin/activate
+pip install setuptools pyelftools esptool pexpect
+./build-all.sh
+```
 
 The toolchain build dominates (30–60 minutes).  Everything after that
 takes a few minutes.

@@ -24,7 +24,7 @@ OBJ=${OBJ:-$W/obj-rv32}
 TOOLS=${TOOLS:-$W/tools-rv32}
 DEST=${DEST:-$W/dest-rv32}
 REL=${REL:-$W/rel-rv32}
-J=${J:-$(nproc 2>/dev/null || echo 2)}
+J=${J:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}
 MAKECONF=$REPO/mk.conf
 NB=$OBJ/nbmake-riscv32
 

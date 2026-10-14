@@ -14,15 +14,18 @@ CROSS=${CROSS:-$TOOLDIR/bin/riscv32--netbsd-}
 KERNEL=$1
 OUT=$2
 
+# file size in bytes (portable: GNU and BSD stat disagree)
+fsize() { wc -c < "$1" | tr -d ' '; }
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 ${CROSS}objcopy -O binary "$KERNEL" "$tmp/netbsd.bin"
 # Pad to a multiple of 4 bytes.
-sz=$(stat -c %s "$tmp/netbsd.bin")
+sz=$(fsize "$tmp/netbsd.bin")
 pad=$(( (4 - sz % 4) % 4 ))
 [ $pad -ne 0 ] && dd if=/dev/zero bs=1 count=$pad >> "$tmp/netbsd.bin" 2>/dev/null
-ksize=$(stat -c %s "$tmp/netbsd.bin")
+ksize=$(fsize "$tmp/netbsd.bin")
 
 start=$(${CROSS}nm "$KERNEL" | awk '$3 == "start" { print $1 }')
 end=$(${CROSS}nm "$KERNEL" | awk '$3 == "_end" { print $1 }')
@@ -37,4 +40,4 @@ ${CROSS}gcc -c -o "$tmp/loader.o" -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
     "$SRC/sys/arch/riscv/espressif/loader/loader.S"
 ${CROSS}ld -o "$tmp/loader.elf" -Ttext=0 -e _start --no-relax "$tmp/loader.o"
 ${CROSS}objcopy -O binary "$tmp/loader.elf" "$OUT"
-echo "wrote $OUT ($(stat -c %s "$OUT") bytes)"
+echo "wrote $OUT ($(fsize "$OUT") bytes)"

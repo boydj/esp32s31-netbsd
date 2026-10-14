@@ -16,12 +16,17 @@ SPL=$1 ITB=$2 DTB=$3 IMG=$4 OUT=$5
 TOOLDIR=${TOOLDIR:?set TOOLDIR to the NetBSD tool directory}
 CROSS=${CROSS:-$TOOLDIR/bin/riscv32--netbsd-}
 ESPTOOL=${ESPTOOL:-esptool}
+command -v "$ESPTOOL" >/dev/null 2>&1 ||
+	{ echo "mkflash.sh: esptool 5.x not found (pip install esptool)" >&2; exit 1; }
 SPL_SRAM_ADDR=0x2F040000
 # DIO/80m is mandatory: elf2image's QIO/40m default makes the ROM read
 # garbage before the SPL's own QIO bring-up.
 FLASHARGS="--flash-mode dio --flash-freq 80m --flash-size 16MB"
 
-imgsz=$(stat -c %s "$IMG")
+# file size in bytes (portable: GNU and BSD stat disagree)
+fsize() { wc -c < "$1" | tr -d ' '; }
+
+imgsz=$(fsize "$IMG")
 if [ "$imgsz" -gt $((0x1000000 - 0x500000)) ]; then
 	echo "kernel image too big ($imgsz bytes)" >&2
 	exit 1
@@ -44,4 +49,4 @@ $ESPTOOL --chip esp32s31 merge-bin -o "$OUT" --format raw $FLASHARGS \
     0x100000 "$ITB" \
     0x300000 "$DTB" \
     0x500000 "$IMG"
-echo "wrote $OUT ($(stat -c %s "$OUT") bytes)"
+echo "wrote $OUT ($(fsize "$OUT") bytes)"

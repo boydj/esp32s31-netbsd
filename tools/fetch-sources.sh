@@ -47,8 +47,10 @@ if [ ! -d qemu ]; then
 	# QEMU's subprojects come from gitlab.com by default; set
 	# QEMU_WRAP_MIRROR=github where only GitHub is reachable.
 	if [ "${QEMU_WRAP_MIRROR:-}" = github ]; then
-		sed -i 's|https://gitlab.com/qemu-project/|https://github.com/qemu/|' \
-		    qemu/subprojects/*.wrap
+		for f in qemu/subprojects/*.wrap; do
+			sed 's|https://gitlab.com/qemu-project/|https://github.com/qemu/|' \
+			    "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+		done
 	fi
 fi
 echo "sources in $W"
