@@ -45,6 +45,8 @@ What works:
   (`mount -t msdos /dev/sd0e /mnt`), USB serial adapters (`cu -l
   /dev/dtyU0 -s 115200`), USB Ethernet adapters (configured by `dhcpcd`
   when plugged in), and hubs;
+* the USB-Serial/JTAG port (the board's "USB" connector, a CDC-ACM
+  device to the host): a login prompt by default, or the console;
 * GPIO through `gpioctl(8)`.
 
 The root file system has `sh`, `vi`, `awk`, `sed`, `grep`, `less`, `ps`,
@@ -53,7 +55,7 @@ tmpfs.
 
 Not supported yet: the second hart (SMP), Wi-Fi/BLE (no public
 programming information), SD/MMC, writing to the flash, USB device
-(gadget) mode, the USB Serial/JTAG console, and an RTC.
+(gadget) mode, and an RTC.
 
 ```
 ESP-ROM:esp32s31-20251218
@@ -91,7 +93,11 @@ esptool --chip esp32s31 --port /dev/ttyUSB0 --baud 1152000 \
     write-flash 0x0 s31_netbsd_flash.bin
 ```
 
-The console is UART0 at 115200 8N1.  Log in as `root` (no password).
+The console is UART0 at 115200 8N1, and there is a login prompt on the
+USB-Serial/JTAG port too (`/dev/ttyACM0` on Linux,
+`/dev/cu.usbmodem*` on macOS).  To make the USB port the console, set
+`stdout-path = "serial1:115200n8"` in `esp32s31.dts`; the UART then gets
+the extra login prompt instead.  Log in as `root` (no password).
 The root file system is read-only; `/tmp`, `/var` and `/root` are in
 memory, so changes are lost at reset.  Plug the Ethernet port into a
 network with a DHCP server and the board configures itself.
@@ -148,19 +154,20 @@ takes a few minutes.
 
 ```sh
 # QEMU model
-test/boot-test.py --reboots 2 --vi --fptest --net --usb
+test/boot-test.py --reboots 2 --vi --fptest --net --usb --usj --gpio
 test/boot-test.py --machopts ",asid=off"     # a core without ASIDs
 test/rx-flood.py                             # UART RX stress
 
 # Espressif's esp-emulator (real mask ROM)
-test/boot-test.py --esp-emu ~/.local/bin/esp-emu --reboots 1 --vi --fptest --net
+test/boot-test.py --esp-emu ~/.local/bin/esp-emu --reboots 1 --vi --fptest --net --gpio
 ```
 
 `boot-test.py` boots the image, logs in, runs commands (pass your own as
 arguments), optionally runs the FPU test, checks DHCP and ping over the
 emulated Ethernet, plugs in a USB stick, a USB Ethernet adapter and an
-FTDI serial adapter (QEMU only), edits a file with `vi` over the console
-and warm-reboots, then halts.  To play with it interactively:
+FTDI serial adapter (QEMU only), logs in over the USB-Serial/JTAG port
+(QEMU only), toggles a GPIO, edits a file with `vi` over the console and
+warm-reboots, then halts.  To play with it interactively:
 
 ```sh
 work/qemu/build/qemu-system-riscv32 -M esp32s31,flash=work/out/s31_netbsd_flash.bin \
@@ -173,7 +180,9 @@ firmware use: CLIC-mode harts (stvec alignment, SPIL in scause, no
 sie/sip), the CLIC, interrupt matrix, SYSTIMER, UART0, TRNG, the reset
 register, the flash XIP window, the Ethernet MAC (QEMU's NPCM GMAC
 model, which is the same DesignWare core with normal descriptors) and the
-USB OTG controller (QEMU's dwc2 host model, as on the Raspberry Pi).
+USB OTG controller (QEMU's dwc2 host model, as on the Raspberry Pi), the
+USB-Serial/JTAG port (on QEMU's second `-serial`) and the GPIO
+registers.
 esp-emulator has no USB OTG model; there `dwctwo0` fails to reset the
 core and the rest of the system carries on.  It emulates the SPL step itself: it
 parses `u-boot.itb` and starts OpenSBI the way the SPL would.  esp-emulator
@@ -186,7 +195,8 @@ independent check of the boot path and the flash image format.
   (`espclic`, `espintmtx`), SYSTIMER (`espsystimer`), UART (`espuart`),
   TRNG (`esptrng`), clocks and resets (`espclkrst`), GPIO and pin muxing
   (`espgpio`), the Ethernet glue for `awge` (`esp_gmac.c`), the USB PHY
-  (`espusbphy`; the controller is the stock `dwctwo`), the flash root
+  (`espusbphy`; the controller is the stock `dwctwo`), the USB-Serial/JTAG
+  port (`espusj`), the flash root
   file system (`espxiproot`), the FDT platform code, and
   `loader/loader.S`.  The
   loader turns the kernel into a RISC-V `Image` that U-Boot can `booti`

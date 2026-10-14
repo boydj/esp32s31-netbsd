@@ -4,11 +4,13 @@ Boot the ESP32-S31 flash image in QEMU's esp32s31 machine, log in on the
 serial console and run a few commands.
 
 usage: boot-test.py [--qemu PATH | --esp-emu PATH] [--flash FILE]
-                    [--reboots N] [--vi] [--net] [--fptest] [--usb]
+                    [--reboots N] [--vi] [--net] [--fptest] [--usb] [--gpio]
+                    [--usj]
                     [cmd ...]
 """
 import argparse
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -38,6 +40,10 @@ ap.add_argument("--fptest", action="store_true",
 ap.add_argument("--usb", action="store_true",
                 help="QEMU only: plug in a USB stick, a USB Ethernet adapter "
                      "and an FTDI serial adapter, and check all three")
+ap.add_argument("--usj", action="store_true",
+                help="QEMU only: log in over the USB-Serial/JTAG port")
+ap.add_argument("--gpio", action="store_true",
+                help="drive a GPIO pin with gpioctl and read it back")
 ap.add_argument("cmds", nargs="*")
 a = ap.parse_args()
 
@@ -62,6 +68,13 @@ else:
             "-nographic", "-serial", "mon:stdio", "-monitor", "none"]
     if a.net:
         argv += ["-nic", "user"]
+    if a.usj:
+        # The USB-Serial/JTAG port is QEMU's second serial port.
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            usj_port = probe.getsockname()[1]
+        argv += ["-serial",
+                 f"tcp:127.0.0.1:{usj_port},server=on,wait=off"]
     if a.usb:
         # A FAT "stick" made by QEMU from a directory, an Ethernet adapter
         # on its own user-mode network, and an FTDI serial adapter.
@@ -107,6 +120,45 @@ if a.net:
           " [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done;"
           " netstat -rn -f inet | grep ^default", "default", 180)
     check("ping", "ping -c 3 -w 10 10.0.2.2", "packet loss")
+def usj_session():
+    """Log in on the USB-Serial/JTAG port and run a command there."""
+    sock = socket.create_connection(("127.0.0.1", usj_port), timeout=5)
+    buf = b""
+
+    def until(pat, secs=60):
+        nonlocal buf
+        end = time.time() + secs
+        while pat not in buf and time.time() < end:
+            try:
+                data = sock.recv(4096)
+            except socket.timeout:
+                continue
+            if not data:
+                break
+            buf += data
+        found = pat in buf
+        buf = b""
+        return found
+
+    sock.sendall(b"\r")
+    ok = until(b"login: ")
+    sock.sendall(b"root\r")
+    ok = ok and until(b"# ")
+    sock.sendall(b"tty </dev/tty 2>/dev/null; sysctl -n hw.machine;"
+                 b" jot 1000 | wc -l\r")
+    ok = ok and until(b"1000")
+    sock.sendall(b"exit\r")
+    sock.close()
+    return ok
+if a.usj:
+    print(f"usb-serial/jtag login: {'ok' if usj_session() else 'FAILED'}",
+          flush=True)
+if a.gpio:
+    # GPIO4 is free on the dev board.
+    check("gpio", "gpioctl -q gpio0 4 set out && gpioctl -q gpio0 4 1 &&"
+          " a=$(gpioctl gpio0 4) && gpioctl -q gpio0 4 0 &&"
+          " b=$(gpioctl gpio0 4) && echo \"[$a] [$b]\"",
+          "[pin 4: state 1] [pin 4: state 0]")
 if a.usb:
     check("usb stick", "mount -t msdos /dev/sd0e /mnt && cat /mnt/hello.txt;"
           " umount /mnt", "hello from a USB stick")

@@ -1,0 +1,301 @@
+From 4df73fa04db336edf8f0f3f53708efc3654a1984 Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 00:36:26 -0400
+Subject: [PATCH 6/6] hw/riscv/esp32s31: add USB-Serial/JTAG and GPIO models
+
+USB-Serial/JTAG: the serial side of endpoint 1 (the CDC-ACM port) at
+0x20391000, interrupt matrix source 2, on the second serial port.  The
+modelled host takes each packet as soon as the firmware commits it.
+
+GPIO: the output, enable and input registers, with every pin reading
+back what it drives.  The GPIO matrix registers just hold their values.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/riscv/esp32s31.c | 220 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 219 insertions(+), 1 deletion(-)
+
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index 38700f2..19db4ee 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -75,6 +75,8 @@ enum {
+     S31_TRNG_BASE       = 0x20814000, S31_TRNG_SIZE   = 0x100,
+     S31_EMAC_BASE       = 0x20350000,
+     S31_USB_BASE        = 0x20300000,
++    S31_USJ_BASE        = 0x20391000, S31_USJ_SIZE    = 0x1000,
++    S31_GPIO_BASE       = 0x20583000, S31_GPIO_SIZE   = 0xe00,
+     S31_INTMTX_BASE     = 0x20585000, S31_INTMTX_SIZE = 0x800,
+     S31_LPAON_BASE      = 0x20701000, S31_LPAON_SIZE  = 0x1000,
+     S31_MTIMER_BASE     = 0x3f000000, /* not on the chip; backs the time CSR */
+@@ -83,6 +85,7 @@ enum {
+ };
+ 
+ #define S31_TIMEBASE_FREQ   320000000
++#define S31_SRC_USJ         2
+ #define S31_SRC_UART0       9
+ #define S31_SRC_SYSTIMER0   33
+ #define S31_SRC_EMAC        98
+@@ -97,7 +100,7 @@ struct Esp32s31State {
+     RISCVHartArrayState cpus;
+     MemoryRegion lpram, hpram, mrom, resetvec, psram, flash;
+     MemoryRegion clic_m_mr, clic_s_mr, intmtx_mr, systimer_mr, uart_mr;
+-    MemoryRegion lpaon_mr, trng_mr;
++    MemoryRegion lpaon_mr, trng_mr, usj_mr, gpio_mr;
+ 
+     /* properties */
+     char *flash_file;
+@@ -135,6 +138,17 @@ struct Esp32s31State {
+     uint32_t rx_head, rx_count;
+     uint32_t uart_int_raw, uart_int_ena;
+     uint32_t uart_regs[0x100 / 4];
++
++    /* USB-Serial/JTAG: endpoint 1, the CDC-ACM serial port */
++    CharFrontend usj_chr;
++    uint8_t usj_tx[64];
++    uint32_t usj_tx_len;
++    uint8_t usj_rx[64];
++    uint32_t usj_rx_head, usj_rx_count;
++    uint32_t usj_int_raw, usj_int_ena;
++
++    /* GPIO (and the GPIO matrix, kept as plain registers) */
++    uint32_t gpio_regs[0xe00 / 4];
+ };
+ 
+ /* ---------------------------------------------------------------- CLIC */
+@@ -650,6 +664,196 @@ static void uart_receive(void *opaque, const uint8_t *buf, int size)
+     uart_update_irq(s);
+ }
+ 
++/* ------------------------------------------------------ USB-Serial/JTAG */
++
++/*
++ * Only the serial side of endpoint 1 is modelled.  The "host" takes every
++ * packet the moment the firmware commits it (WR_DONE) and hands it to the
++ * second serial port; bytes from that port arrive as packets of up to 64.
++ */
++#define USJ_EP1             0x00
++#define USJ_EP1_CONF        0x04
++#define  USJ_WR_DONE            (1u << 0)
++#define  USJ_IN_EP_DATA_FREE    (1u << 1)
++#define  USJ_OUT_EP_DATA_AVAIL  (1u << 2)
++#define USJ_INT_RAW         0x08
++#define USJ_INT_ST          0x0c
++#define USJ_INT_ENA         0x10
++#define USJ_INT_CLR         0x14
++#define  USJ_INT_OUT_RECV_PKT   (1u << 2)
++#define  USJ_INT_IN_EMPTY       (1u << 3)
++#define USJ_IN_EP1_ST       0x2c
++#define USJ_OUT_EP1_ST      0x3c
++#define USJ_DATE            0x80
++
++static uint32_t usj_raw(Esp32s31State *s)
++{
++    /* IN_EMPTY is a level: it stays up while the IN FIFO is empty. */
++    return s->usj_int_raw | (s->usj_tx_len == 0 ? USJ_INT_IN_EMPTY : 0);
++}
++
++static void usj_update_irq(Esp32s31State *s)
++{
++    esp32s31_set_source(s, S31_SRC_USJ, (usj_raw(s) & s->usj_int_ena) != 0);
++}
++
++static uint64_t usj_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++    uint32_t val = 0;
++
++    switch (addr) {
++    case USJ_EP1:
++        if (s->usj_rx_count) {
++            val = s->usj_rx[s->usj_rx_head++];
++            if (--s->usj_rx_count == 0) {
++                s->usj_rx_head = 0;
++                qemu_chr_fe_accept_input(&s->usj_chr);
++            }
++        }
++        break;
++    case USJ_EP1_CONF:
++        if (s->usj_tx_len < sizeof(s->usj_tx)) {
++            val |= USJ_IN_EP_DATA_FREE;
++        }
++        if (s->usj_rx_count) {
++            val |= USJ_OUT_EP_DATA_AVAIL;
++        }
++        break;
++    case USJ_INT_RAW:
++        val = usj_raw(s);
++        break;
++    case USJ_INT_ST:
++        val = usj_raw(s) & s->usj_int_ena;
++        break;
++    case USJ_INT_ENA:
++        val = s->usj_int_ena;
++        break;
++    case USJ_IN_EP1_ST:
++        val = s->usj_tx_len << 2;
++        break;
++    case USJ_OUT_EP1_ST:
++        val = s->usj_rx_count << 16;
++        break;
++    case USJ_DATE:
++        val = 0x2506250;
++        break;
++    }
++    return val;
++}
++
++static void usj_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    switch (addr) {
++    case USJ_EP1:
++        if (s->usj_tx_len < sizeof(s->usj_tx)) {
++            s->usj_tx[s->usj_tx_len++] = val;
++        }
++        break;
++    case USJ_EP1_CONF:
++        if (val & USJ_WR_DONE) {
++            if (s->usj_tx_len) {
++                qemu_chr_fe_write_all(&s->usj_chr, s->usj_tx, s->usj_tx_len);
++            }
++            s->usj_tx_len = 0;
++        }
++        break;
++    case USJ_INT_ENA:
++        s->usj_int_ena = val;
++        break;
++    case USJ_INT_CLR:
++        s->usj_int_raw &= ~val;
++        break;
++    }
++    usj_update_irq(s);
++}
++
++static const MemoryRegionOps usj_ops = {
++    .read = usj_read,
++    .write = usj_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static int usj_can_receive(void *opaque)
++{
++    Esp32s31State *s = opaque;
++
++    return s->usj_rx_count ? 0 : sizeof(s->usj_rx);
++}
++
++static void usj_receive(void *opaque, const uint8_t *buf, int size)
++{
++    Esp32s31State *s = opaque;
++
++    size = MIN(size, (int)sizeof(s->usj_rx));
++    memcpy(s->usj_rx, buf, size);
++    s->usj_rx_head = 0;
++    s->usj_rx_count = size;
++    s->usj_int_raw |= USJ_INT_OUT_RECV_PKT;
++    usj_update_irq(s);
++}
++
++/* ----------------------------------------------------------------- GPIO */
++
++/*
++ * Two banks of output, enable and input registers.  There are no pads:
++ * a pin reads back what it drives when its output is enabled, else 0.
++ */
++#define GPIO_OUT(b)         (0x04 + (b) * 0x0c)
++#define GPIO_ENABLE(b)      (0x34 + (b) * 0x0c)
++#define GPIO_IN(b)          (0x64 + (b) * 0x04)
++
++static uint64_t gpio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    for (int b = 0; b < 2; b++) {
++        if (addr == GPIO_IN(b)) {
++            return s->gpio_regs[GPIO_OUT(b) / 4] &
++                   s->gpio_regs[GPIO_ENABLE(b) / 4];
++        }
++        if (addr == GPIO_OUT(b) + 4 || addr == GPIO_OUT(b) + 8 ||
++            addr == GPIO_ENABLE(b) + 4 || addr == GPIO_ENABLE(b) + 8) {
++            return 0;       /* write-1-to-set/clear registers */
++        }
++    }
++    return s->gpio_regs[addr / 4];
++}
++
++static void gpio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    Esp32s31State *s = opaque;
++
++    for (int b = 0; b < 2; b++) {
++        hwaddr base[2] = { GPIO_OUT(b), GPIO_ENABLE(b) };
++
++        for (int r = 0; r < 2; r++) {
++            if (addr == base[r] + 4) {          /* W1TS */
++                s->gpio_regs[base[r] / 4] |= val;
++                return;
++            }
++            if (addr == base[r] + 8) {          /* W1TC */
++                s->gpio_regs[base[r] / 4] &= ~val;
++                return;
++            }
++        }
++        if (addr == GPIO_IN(b)) {
++            return;
++        }
++    }
++    s->gpio_regs[addr / 4] = val;
++}
++
++static const MemoryRegionOps gpio_ops = {
++    .read = gpio_read,
++    .write = gpio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
+ /* ------------------------------------------------------- LP AON (reset) */
+ 
+ static uint64_t lpaon_read(void *opaque, hwaddr addr, unsigned size)
+@@ -748,6 +952,9 @@ static void esp32s31_reset(void *opaque)
+     s->uart_int_ena = s->uart_int_raw = 0;
+     memset(s->uart_regs, 0, sizeof(s->uart_regs));
+     s->uart_regs[UART_CONF1 / 4] = 0x60 | (0x60 << 10);
++    s->usj_tx_len = s->usj_rx_head = s->usj_rx_count = 0;
++    s->usj_int_raw = s->usj_int_ena = 0;
++    memset(s->gpio_regs, 0, sizeof(s->gpio_regs));
+ }
+ 
+ static const void *fit_image_data(const void *fit, int node, size_t *len)
+@@ -918,6 +1125,12 @@ static void esp32s31_machine_init(MachineState *machine)
+     memory_region_init_io(&s->lpaon_mr, NULL, &lpaon_ops, s,
+                           "esp32s31.lpaon", S31_LPAON_SIZE);
+     memory_region_add_subregion(sysmem, S31_LPAON_BASE, &s->lpaon_mr);
++    memory_region_init_io(&s->gpio_mr, NULL, &gpio_ops, s,
++                          "esp32s31.gpio", S31_GPIO_SIZE);
++    memory_region_add_subregion(sysmem, S31_GPIO_BASE, &s->gpio_mr);
++    memory_region_init_io(&s->usj_mr, NULL, &usj_ops, s,
++                          "esp32s31.usb-serial-jtag", S31_USJ_SIZE);
++    memory_region_add_subregion(sysmem, S31_USJ_BASE, &s->usj_mr);
+     memory_region_init_io(&s->trng_mr, NULL, &trng_ops, s,
+                           "esp32s31.trng", S31_TRNG_SIZE);
+     memory_region_add_subregion(sysmem, S31_TRNG_BASE, &s->trng_mr);
+@@ -960,6 +1173,11 @@ static void esp32s31_machine_init(MachineState *machine)
+     qemu_chr_fe_set_handlers(&s->chr, uart_can_receive, uart_receive,
+                              NULL, NULL, s, NULL, true);
+ 
++    /* The USB-Serial/JTAG port is the second serial port (-serial). */
++    qemu_chr_fe_init(&s->usj_chr, serial_hd(1), &error_fatal);
++    qemu_chr_fe_set_handlers(&s->usj_chr, usj_can_receive, usj_receive,
++                             NULL, NULL, s, NULL, true);
++
+     /* The time CSR, used by OpenSBI to emulate S-mode rdtime. */
+     riscv_aclint_mtimer_create(S31_MTIMER_BASE,
+             RISCV_ACLINT_DEFAULT_MTIMER_SIZE, 0, s->cpus.num_harts,
+-- 
+2.43.0
+

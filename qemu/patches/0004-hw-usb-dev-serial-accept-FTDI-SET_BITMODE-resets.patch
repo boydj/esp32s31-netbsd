@@ -1,7 +1,7 @@
 From feb41f0e87617c0625a4fb2e65656fa2cdd77c5e Mon Sep 17 00:00:00 2001
 From: Josh Boyd <boydjd@jbip.net>
 Date: Wed, 14 Oct 2026 00:13:56 -0400
-Subject: [PATCH 4/5] hw/usb/dev-serial: accept FTDI SET_BITMODE resets
+Subject: [PATCH 4/6] hw/usb/dev-serial: accept FTDI SET_BITMODE resets
 
 NetBSD's uftdi driver resets the bit mode before every parameter change
 and fails with EIO when the request stalls.  Bit-bang modes aren't
