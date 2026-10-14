@@ -151,7 +151,9 @@ independent check of the boot path and the flash image format.
   straight from the flash XIP window, then copies it to PSRAM.
 * **Generic riscv changes** in the same branch: soft-float riscv32
   userland, Sv32 direct map and other RV32 VM fixes, `options RISCV_CLIC`,
-  pluggable timer/`delay(9)`, a `.bss` clearing fix in locore.
+  pluggable timer/`delay(9)`, a `.bss` clearing fix in locore.  To check
+  they don't regress riscv64, `GENERIC64` was built and booted on QEMU's
+  `virt` machine (2 harts) up to the root device prompt.
 * **Firmware**: Espressif's OpenSBI and U-Boot, unmodified, built with
   the NetBSD toolchain (`tools/build-firmware.sh`).
 
