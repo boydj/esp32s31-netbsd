@@ -38,10 +38,22 @@ static bool cpufreq_ok(uint32_t mhz)
     return false;
 }
 
+/* Only from the CPLL at 320 MHz, which the dividers assume. */
+static bool cpufreq_scalable(void)
+{
+    rtc_cpu_freq_config_t cur;
+
+    rtc_clk_cpu_freq_get_config(&cur);
+    return cur.source == SOC_CPU_CLK_SRC_CPLL && cur.source_freq_mhz == 320;
+}
+
 static int cpufreq_set(uint32_t mhz)
 {
     rtc_cpu_freq_config_t cfg;
 
+    if (!cpufreq_scalable()) {
+        return ESPCP_EOPNOTSUPP;
+    }
     if (!cpufreq_ok(mhz) || !rtc_clk_cpu_freq_mhz_to_config(mhz, &cfg)) {
         return ESPCP_EINVAL;
     }
@@ -92,6 +104,10 @@ void espcp_power_ctl(uint8_t type, uint32_t seq, const void *data, size_t len)
     memset(&ps, 0, sizeof(ps));
     rtc_clk_cpu_freq_get_config(&cur);
     ps.ps_mhz = cur.freq_mhz;
-    memcpy(ps.ps_avail, cpu_mhz, sizeof(cpu_mhz));
+    if (cpufreq_scalable()) {
+        memcpy(ps.ps_avail, cpu_mhz, sizeof(cpu_mhz));
+    } else {
+        ps.ps_avail[0] = cur.freq_mhz;
+    }
     espcp_ctl_reply(type, seq, error, &ps, sizeof(ps));
 }
