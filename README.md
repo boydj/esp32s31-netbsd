@@ -103,8 +103,8 @@ esp32s31-loader: copying NetBSD kernel to PSRAM
 [   1.0000000] espusj0 at simplebus1: ESP32-S31 USB-Serial/JTAG
 [   1.0000000] dwcmmc0 at simplebus1: DesignWare SD/MMC
 [   1.0000000] dwctwo0 at simplebus1: DesignWare USB2 OTG
-[   1.2596627] espcp0: espcp 1.1, 1169 KiB, 1024 KiB PSRAM at 0x503a7000
-[   1.2996404] espcp0: espcp 1.1, ESP-IDF ab95e707 running, interrupting on intmtx source 67
+[   1.2596627] espcp0: espcp v0.3.0, 1169 KiB, 1024 KiB PSRAM at 0x503a7000
+[   1.2996404] espcp0: espcp v0.3.0, ESP-IDF ab95e707-dirty running, interrupting on intmtx source 67
 [   1.2996404] espwifi0 at espcp0: Wi-Fi station, address 24:0a:c4:00:00:01
 [   1.2996404] espbt0 at espcp0: Bluetooth BR/EDR + LE controller, address 24:0a:c4:00:00:02
 [   1.2996404] root on md0a dumps on md0b
