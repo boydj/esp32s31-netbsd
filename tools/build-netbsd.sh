@@ -68,14 +68,19 @@ do
 	    $NB install >/dev/null)
 done
 
+# dhcpcd's hook scripts, which the root file system copies from $DEST.
+step "dhcpcd hooks"
+(cd "$SRC/external/bsd/dhcpcd/libexec" && $NB obj >/dev/null &&
+    $NB -j"$J" dependall >/dev/null && $NB install >/dev/null)
+
 step "MAKEDEV"
 (cd "$SRC/etc" && $NB obj >/dev/null && $NB MAKEDEV >/dev/null)
 
-step "ramdisk"
+step "root file system"
 (cd "$SRC/distrib/riscv/esp32s31" && $NB obj >/dev/null && $NB -j"$J" >/dev/null)
 
 step "kernel"
 $B kernel=ESP32S31 >/dev/null
 
 echo "kernel:  $OBJ/sys/arch/riscv/compile/ESP32S31/netbsd"
-echo "ramdisk: $OBJ/distrib/riscv/esp32s31/esp32s31-root.fs"
+echo "root:    $OBJ/distrib/riscv/esp32s31/esp32s31-root.fs"
