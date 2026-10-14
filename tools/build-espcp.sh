@@ -61,5 +61,5 @@ cd "$REPO/espcp"
 	idf.py --preview -B "$B" -D SDKCONFIG="$B/sdkconfig" set-target esp32s31
 idf.py --preview -B "$B" -D SDKCONFIG="$B/sdkconfig" build
 
-IDENT="espcp $(git -C "$REPO" describe --always --dirty 2>/dev/null || echo 1.0)"
+IDENT="espcp $(git -C "$REPO" describe --tags --always --dirty 2>/dev/null || echo 1.0)"
 python3 "$REPO/espcp/mkimage.py" --ident "$IDENT" "$B/espcp.elf" "$B/espcp.img"
