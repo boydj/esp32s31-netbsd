@@ -55,6 +55,11 @@ ap.add_argument("--hw", action="store_true",
                 help="sensors, RTC time across a reboot, watchdog reset")
 ap.add_argument("--persist", action="store_true",
                 help="write to /persist and /etc (flash), check after a reboot")
+ap.add_argument("--crypto", action="store_true",
+                help="check espcrypto(4): the AES implementation, and"
+                     " test/cryptotest (built by its build.sh, served from"
+                     " /tmp/httproot) through /dev/crypto; needs --wifi"
+                     " or --net, and esp-emulator (QEMU has no engines)")
 ap.add_argument("--wifi", action="store_true",
                 help="join the access point (esp-emulator's, or QEMU's "
                      "stand-in) with espwifictl, then DHCP, ping and an HTTP "
@@ -219,6 +224,13 @@ if a.bt:
     check("bt rfcomm", "(echo hello-rfcomm; sleep 4) |"
           " rfcomm_sppd -a aa:bb:cc:dd:ee:01 -s SP & sleep 10; kill $! 2>/dev/null",
           "HELLO-RFCOMM", 120)
+if a.crypto:
+    check("crypto aes", "sysctl -n kern.crypto.aes.selected", "ESP32-S31 AES")
+    check("crypto dev", f"ftp -o /tmp/cryptotest http://{gateway}:8088/"
+          "cryptotest >/dev/null 2>&1; chmod +x /tmp/cryptotest;"
+          " /tmp/cryptotest", "cryptotest: ok", 300)
+    check("crypto hw", "vmstat -e | grep -E 'espcrypto0 (SHA|modexp)' |"
+          " awk '$4 > 0 { n++ } END { print \"hw-used-\" n }'", "hw-used-2")
 def usj_session():
     """Log in on the USB-Serial/JTAG port and run a command there."""
     sock = socket.create_connection(("127.0.0.1", usj_port), timeout=5)

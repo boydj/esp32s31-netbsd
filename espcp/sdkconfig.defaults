@@ -44,3 +44,14 @@ CONFIG_BTDM_CTRL_MODE_BTDM=y
 
 # Leave the GPIO matrix to the host: no light-sleep pin isolation.
 # CONFIG_ESP_SLEEP_GPIO_RESET_WORKAROUND is not set
+
+# The AES, SHA and RSA accelerators belong to NetBSD's espcrypto(4), and
+# the ECC engine to the Bluetooth controller: mbedTLS (the WPA2/WPA3
+# handshakes) does without all of them.
+# CONFIG_MBEDTLS_HARDWARE_AES is not set
+# CONFIG_MBEDTLS_HARDWARE_GCM is not set
+# CONFIG_MBEDTLS_HARDWARE_SHA is not set
+# CONFIG_MBEDTLS_HARDWARE_MPI is not set
+# CONFIG_MBEDTLS_HARDWARE_ECC is not set
+# CONFIG_MBEDTLS_HARDWARE_ECDSA_VERIFY is not set
+# CONFIG_MBEDTLS_HARDWARE_ECDSA_SIGN is not set
