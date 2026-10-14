@@ -118,8 +118,12 @@ if a.net:
     # The guest's dhcpcd runs in the background; give it time to finish.
     check("dhcp", "i=0; while ! netstat -rn -f inet | grep -q ^default &&"
           " [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done;"
-          " netstat -rn -f inet | grep ^default", "default", 180)
-    check("ping", "ping -c 3 -w 10 10.0.2.2", "packet loss")
+          " netstat -rn -f inet | grep -q ^default && echo dhcp-$((6*7))",
+          "dhcp-42", 180)
+    # The gateway is 10.0.2.2 in QEMU and 192.168.4.1 in esp-emulator.
+    check("ping", "ping -c 3 -w 10 $(netstat -rn -f inet |"
+          " awk '$1 == \"default\" { print $2; exit }')",
+          " 0.0% packet loss")
 def usj_session():
     """Log in on the USB-Serial/JTAG port and run a command there."""
     sock = socket.create_connection(("127.0.0.1", usj_port), timeout=5)

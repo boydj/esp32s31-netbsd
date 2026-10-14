@@ -1,7 +1,8 @@
 #!/bin/sh
 #
 # build-netbsd.sh: build the NetBSD/riscv32 toolchain, the static libraries
-# the ramdisk needs, the crunched ramdisk and the ESP32S31 kernel.
+# the root file system needs, the crunched root file system and the
+# ESP32S31 kernel.
 #
 # This deliberately does not run "build.sh distribution": only a minimal,
 # static userland is needed (see ../mk.conf), and building just that is

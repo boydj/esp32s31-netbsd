@@ -1,0 +1,267 @@
+From e034daabbe61d5fbc90b450848e9a918222bf0fc Mon Sep 17 00:00:00 2001
+From: Josh Boyd <boydjd@jbip.net>
+Date: Wed, 14 Oct 2026 01:30:54 -0400
+Subject: [PATCH 7/7] hw/net/npcm_gmac: support enhanced descriptors; use them
+ for the S31
+
+The ESP32-S31's GMAC is built with enhanced (alternate) descriptors,
+which keep the TX control bits in DES0 and lay out DES1's buffer sizes
+and ring/chain bits differently.  Add an "enhanced-desc" property that
+converts descriptors on the way in, writes back only DES0 (OWN and
+status) on the way out, and reports ENHDESSEL in the HW feature
+register.  The esp32s31 machine turns it on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0158d423kzUx8WWBMMEZ95NX
+---
+ hw/net/npcm_gmac.c         | 110 +++++++++++++++++++++++++++++++++----
+ hw/riscv/esp32s31.c        |   7 ++-
+ include/hw/net/npcm_gmac.h |   2 +
+ 3 files changed, 107 insertions(+), 12 deletions(-)
+
+diff --git a/hw/net/npcm_gmac.c b/hw/net/npcm_gmac.c
+index d9902d9..feca315 100644
+--- a/hw/net/npcm_gmac.c
++++ b/hw/net/npcm_gmac.c
+@@ -139,6 +139,9 @@ static void npcm_gmac_soft_reset(NPCMGMACState *gmac)
+            NPCM_GMAC_NR_REGS * sizeof(uint32_t));
+     /* Clear reset bits */
+     gmac->regs[R_NPCM_DMA_BUS_MODE] &= ~NPCM_DMA_BUS_MODE_SWR;
++    if (gmac->enh_desc) {
++        gmac->regs[R_NPCM_DMA_HW_FEATURE] |= BIT(24);   /* ENHDESSEL */
++    }
+ }
+ 
+ static void gmac_phy_set_link(NPCMGMACState *gmac, bool active)
+@@ -207,7 +210,75 @@ static void gmac_update_irq(NPCMGMACState *gmac)
+     qemu_set_irq(gmac->irq, level);
+ }
+ 
+-static int gmac_read_rx_desc(dma_addr_t addr, struct NPCMGMACRxDesc *desc)
++/*
++ * Enhanced ("alternate") descriptors keep the TX control bits in TDES0
++ * and lay out the buffer sizes and ring/chain bits of DES1 differently.
++ * The model works on normal descriptors: convert on the way in, and on
++ * the way out write back only DES0 (OWN and status), which is all the
++ * DMA engine updates.
++ */
++static uint32_t gmac_size11(uint32_t size)
++{
++    return MIN(size, 0x7ffu);
++}
++
++static void gmac_rx_desc_from_enh(struct NPCMGMACRxDesc *desc)
++{
++    uint32_t e1 = desc->rdes1;
++
++    desc->rdes1 = (e1 & RX_DESC_RDES1_DIS_INTR_COMP_MASK) |
++        (extract32(e1, 15, 1) ? RX_DESC_RDES1_RC_END_RING_MASK : 0) |
++        (extract32(e1, 14, 1) ? RX_DESC_RDES1_SEC_ADDR_CHND_MASK : 0) |
++        gmac_size11(extract32(e1, 16, 13)) << RX_DESC_RDES1_BFFR2_SZ_SHIFT |
++        gmac_size11(extract32(e1, 0, 13));
++}
++
++static void gmac_tx_desc_from_enh(struct NPCMGMACTxDesc *desc)
++{
++    uint32_t e0 = desc->tdes0, e1 = desc->tdes1;
++
++    desc->tdes0 = e0 & (TX_DESC_TDES0_OWN | 0x3ffff);
++    desc->tdes1 = (extract32(e0, 30, 1) ? TX_DESC_TDES1_INTERR_COMP_MASK : 0) |
++        (extract32(e0, 29, 1) ? TX_DESC_TDES1_LAST_SEG_MASK : 0) |
++        (extract32(e0, 28, 1) ? TX_DESC_TDES1_FIRST_SEG_MASK : 0) |
++        extract32(e0, 22, 2) << 27 |
++        (extract32(e0, 27, 1) ? TX_DESC_TDES1_DIS_CDC_MASK : 0) |
++        (extract32(e0, 21, 1) ? TX_DESC_TDES1_TX_END_RING_MASK : 0) |
++        (extract32(e0, 20, 1) ? TX_DESC_TDES1_SEC_ADDR_CHND_MASK : 0) |
++        extract32(e0, 26, 1) << 23 |
++        gmac_size11(extract32(e1, 16, 13)) << 11 |
++        gmac_size11(extract32(e1, 0, 13));
++}
++
++static uint32_t gmac_tx_desc0_to_enh(const struct NPCMGMACTxDesc *desc)
++{
++    uint32_t t1 = desc->tdes1;
++
++    return (desc->tdes0 & (TX_DESC_TDES0_OWN | 0x3ffff)) |
++        ((t1 & TX_DESC_TDES1_INTERR_COMP_MASK) ? BIT(30) : 0) |
++        ((t1 & TX_DESC_TDES1_LAST_SEG_MASK) ? BIT(29) : 0) |
++        ((t1 & TX_DESC_TDES1_FIRST_SEG_MASK) ? BIT(28) : 0) |
++        TX_DESC_TDES1_CHKSM_INS_CTRL_MASK(t1) << 22 |
++        ((t1 & TX_DESC_TDES1_DIS_CDC_MASK) ? BIT(27) : 0) |
++        ((t1 & TX_DESC_TDES1_TX_END_RING_MASK) ? BIT(21) : 0) |
++        ((t1 & TX_DESC_TDES1_SEC_ADDR_CHND_MASK) ? BIT(20) : 0) |
++        (extract32(t1, 23, 1) << 26);
++}
++
++static int gmac_write_desc0(dma_addr_t addr, uint32_t des0)
++{
++    des0 = cpu_to_le32(des0);
++    if (dma_memory_write(&address_space_memory, addr, &des0, sizeof(des0),
++                         MEMTXATTRS_UNSPECIFIED)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: Failed to write descriptor @ 0x%"
++                      HWADDR_PRIx "\n", __func__, addr);
++        return -1;
++    }
++    return 0;
++}
++
++static int gmac_read_rx_desc(NPCMGMACState *gmac, dma_addr_t addr,
++                             struct NPCMGMACRxDesc *desc)
+ {
+     if (dma_memory_read(&address_space_memory, addr, desc,
+                         sizeof(*desc), MEMTXATTRS_UNSPECIFIED)) {
+@@ -219,12 +290,20 @@ static int gmac_read_rx_desc(dma_addr_t addr, struct NPCMGMACRxDesc *desc)
+     desc->rdes1 = le32_to_cpu(desc->rdes1);
+     desc->rdes2 = le32_to_cpu(desc->rdes2);
+     desc->rdes3 = le32_to_cpu(desc->rdes3);
++    if (gmac->enh_desc) {
++        gmac_rx_desc_from_enh(desc);
++    }
+     return 0;
+ }
+ 
+-static int gmac_write_rx_desc(dma_addr_t addr, struct NPCMGMACRxDesc *desc)
++static int gmac_write_rx_desc(NPCMGMACState *gmac, dma_addr_t addr,
++                              struct NPCMGMACRxDesc *desc)
+ {
+     struct NPCMGMACRxDesc le_desc;
++
++    if (gmac->enh_desc) {
++        return gmac_write_desc0(addr, desc->rdes0);
++    }
+     le_desc.rdes0 = cpu_to_le32(desc->rdes0);
+     le_desc.rdes1 = cpu_to_le32(desc->rdes1);
+     le_desc.rdes2 = cpu_to_le32(desc->rdes2);
+@@ -238,7 +317,8 @@ static int gmac_write_rx_desc(dma_addr_t addr, struct NPCMGMACRxDesc *desc)
+     return 0;
+ }
+ 
+-static int gmac_read_tx_desc(dma_addr_t addr, struct NPCMGMACTxDesc *desc)
++static int gmac_read_tx_desc(NPCMGMACState *gmac, dma_addr_t addr,
++                             struct NPCMGMACTxDesc *desc)
+ {
+     if (dma_memory_read(&address_space_memory, addr, desc,
+                         sizeof(*desc), MEMTXATTRS_UNSPECIFIED)) {
+@@ -250,12 +330,20 @@ static int gmac_read_tx_desc(dma_addr_t addr, struct NPCMGMACTxDesc *desc)
+     desc->tdes1 = le32_to_cpu(desc->tdes1);
+     desc->tdes2 = le32_to_cpu(desc->tdes2);
+     desc->tdes3 = le32_to_cpu(desc->tdes3);
++    if (gmac->enh_desc) {
++        gmac_tx_desc_from_enh(desc);
++    }
+     return 0;
+ }
+ 
+-static int gmac_write_tx_desc(dma_addr_t addr, struct NPCMGMACTxDesc *desc)
++static int gmac_write_tx_desc(NPCMGMACState *gmac, dma_addr_t addr,
++                              struct NPCMGMACTxDesc *desc)
+ {
+     struct NPCMGMACTxDesc le_desc;
++
++    if (gmac->enh_desc) {
++        return gmac_write_desc0(addr, gmac_tx_desc0_to_enh(desc));
++    }
+     le_desc.tdes0 = cpu_to_le32(desc->tdes0);
+     le_desc.tdes1 = cpu_to_le32(desc->tdes1);
+     le_desc.tdes2 = cpu_to_le32(desc->tdes2);
+@@ -339,7 +427,7 @@ static ssize_t gmac_receive(NetClientState *nc, const uint8_t *buf, size_t len)
+     gmac_dma_set_state(gmac, NPCM_DMA_STATUS_RX_PROCESS_STATE_SHIFT,
+         NPCM_DMA_STATUS_RX_RUNNING_FETCHING_STATE);
+     trace_npcm_gmac_packet_desc_read(DEVICE(gmac)->canonical_path, desc_addr);
+-    if (gmac_read_rx_desc(desc_addr, &rx_desc)) {
++    if (gmac_read_rx_desc(gmac, desc_addr, &rx_desc)) {
+         qemu_log_mask(LOG_GUEST_ERROR, "RX Descriptor @ 0x%x cant be read\n",
+                       desc_addr);
+         gmac_dma_set_state(gmac, NPCM_DMA_STATUS_RX_PROCESS_STATE_SHIFT,
+@@ -419,7 +507,7 @@ static ssize_t gmac_receive(NetClientState *nc, const uint8_t *buf, size_t len)
+                                         rx_desc.rdes2, rx_desc.rdes3);
+ 
+         /* step 5 */
+-        gmac_write_rx_desc(desc_addr, &rx_desc);
++        gmac_write_rx_desc(gmac, desc_addr, &rx_desc);
+         trace_npcm_gmac_debug_desc_data(DEVICE(gmac)->canonical_path,
+                                         &rx_desc, rx_desc.rdes0,
+                                         rx_desc.rdes1, rx_desc.rdes2,
+@@ -436,7 +524,7 @@ static ssize_t gmac_receive(NetClientState *nc, const uint8_t *buf, size_t len)
+             }
+             trace_npcm_gmac_packet_desc_read(DEVICE(gmac)->canonical_path,
+                                              desc_addr);
+-            if (gmac_read_rx_desc(desc_addr, &rx_desc)) {
++            if (gmac_read_rx_desc(gmac, desc_addr, &rx_desc)) {
+                 qemu_log_mask(LOG_GUEST_ERROR,
+                               "RX Descriptor @ 0x%x cant be read\n",
+                               desc_addr);
+@@ -476,7 +564,7 @@ static ssize_t gmac_receive(NetClientState *nc, const uint8_t *buf, size_t len)
+     trace_npcm_gmac_packet_received(DEVICE(gmac)->canonical_path, left_frame);
+     gmac_dma_set_state(gmac, NPCM_DMA_STATUS_RX_PROCESS_STATE_SHIFT,
+         NPCM_DMA_STATUS_RX_RUNNING_WAITING_STATE);
+-    gmac_write_rx_desc(desc_addr, &rx_desc);
++    gmac_write_rx_desc(gmac, desc_addr, &rx_desc);
+ 
+     /* Get next descriptor address (chained or sequential) */
+     if (rx_desc.rdes1 & RX_DESC_RDES1_RC_END_RING_MASK) {
+@@ -529,7 +617,7 @@ static void gmac_try_send_next_packet(NPCMGMACState *gmac)
+     while (true) {
+         gmac_dma_set_state(gmac, NPCM_DMA_STATUS_TX_PROCESS_STATE_SHIFT,
+             NPCM_DMA_STATUS_TX_RUNNING_FETCHING_STATE);
+-        if (gmac_read_tx_desc(desc_addr, &tx_desc)) {
++        if (gmac_read_tx_desc(gmac, desc_addr, &tx_desc)) {
+             qemu_log_mask(LOG_GUEST_ERROR,
+                           "TX Descriptor @ 0x%x can't be read\n",
+                           desc_addr);
+@@ -618,7 +706,7 @@ static void gmac_try_send_next_packet(NPCMGMACState *gmac)
+         /* step 6 */
+         gmac_dma_set_state(gmac, NPCM_DMA_STATUS_TX_PROCESS_STATE_SHIFT,
+             NPCM_DMA_STATUS_TX_RUNNING_CLOSING_STATE);
+-        gmac_write_tx_desc(desc_addr, &tx_desc);
++        gmac_write_tx_desc(gmac, desc_addr, &tx_desc);
+         if (tx_desc.tdes1 & TX_DESC_TDES1_TX_END_RING_MASK) {
+             desc_addr = gmac->regs[R_NPCM_DMA_TX_BASE_ADDR];
+         } else if (tx_desc.tdes1 & TX_DESC_TDES1_SEC_ADDR_CHND_MASK) {
+@@ -926,6 +1014,8 @@ static const VMStateDescription vmstate_npcm_gmac = {
+ 
+ static const Property npcm_gmac_properties[] = {
+     DEFINE_NIC_PROPERTIES(NPCMGMACState, conf),
++    /* Enhanced (alternate) descriptors, as on the ESP32-S31's GMAC */
++    DEFINE_PROP_BOOL("enhanced-desc", NPCMGMACState, enh_desc, false),
+ };
+ 
+ static void npcm_gmac_class_init(ObjectClass *klass, const void *data)
+diff --git a/hw/riscv/esp32s31.c b/hw/riscv/esp32s31.c
+index 19db4ee..79815d7 100644
+--- a/hw/riscv/esp32s31.c
++++ b/hw/riscv/esp32s31.c
+@@ -1137,12 +1137,15 @@ static void esp32s31_machine_init(MachineState *machine)
+ 
+     /*
+      * Ethernet: the EMAC is a DesignWare GMAC 3.70a, close enough to the
+-     * GMAC that QEMU models for the Nuvoton NPCM SoCs (normal descriptors,
+-     * an internal PHY at address 0).  Takes the default -nic.
++     * GMAC that QEMU models for the Nuvoton NPCM SoCs (an internal PHY at
++     * address 0), with the enhanced descriptors the S31 is built with.
++     * Takes the default -nic.
+      */
+     {
+         DeviceState *gmac = qdev_new(TYPE_NPCM_GMAC);
+ 
++        qdev_prop_set_bit(gmac, "enhanced-desc", true);
++
+         qemu_configure_nic_device(gmac, true, NULL);
+         sysbus_realize_and_unref(SYS_BUS_DEVICE(gmac), &error_fatal);
+         sysbus_mmio_map(SYS_BUS_DEVICE(gmac), 0, S31_EMAC_BASE);
+diff --git a/include/hw/net/npcm_gmac.h b/include/hw/net/npcm_gmac.h
+index 23b9841..60beb58 100644
+--- a/include/hw/net/npcm_gmac.h
++++ b/include/hw/net/npcm_gmac.h
+@@ -166,6 +166,8 @@ typedef struct NPCMGMACState {
+ 
+     uint32_t regs[NPCM_GMAC_NR_REGS];
+     uint16_t phy_regs[NPCM_GMAC_MAX_PHYS][NPCM_GMAC_MAX_PHY_REGS];
++
++    bool enh_desc;
+ } NPCMGMACState;
+ 
+ #define TYPE_NPCM_GMAC "npcm-gmac"
+-- 
+2.43.0
+
